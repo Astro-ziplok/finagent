@@ -1,0 +1,35 @@
+# FinAgent — Python Dependencies
+# Install all with: pip install -r requirements.txt
+#
+# Versions are intentionally unpinned to ensure compatibility
+# with Python 3.13+ and avoid build-from-source errors.
+
+# --- Data Collection ---
+yfinance          # Yahoo Finance stock prices, financials, sector ETFs, commodity futures
+requests          # HTTP requests (NewsAPI)
+httpx             # Async HTTP client (backup)
+feedparser        # Free RSS news parsing (Yahoo Finance RSS, Google News RSS)
+
+# --- Data Processing ---
+pandas            # DataFrames — backbone of all data work
+numpy             # Numerical operations
+scipy             # Statistical functions (outlier detection)
+
+# --- Visualization ---
+matplotlib        # Base charting library
+seaborn           # Statistical charts (heatmaps, distributions)
+plotly            # Interactive charts (optional bonus)
+
+# --- AI / LLM ---
+# Groq uses the same openai Python library — just pointed at a different URL.
+openai            # Used as the Groq API client (compatible interface)
+
+# --- Environment & Config ---
+python-dotenv     # Load .env file automatically
+
+# --- Code Quality ---
+black             # Auto-formatter (keeps code PEP8 compliant)
+
+# --- Testing ---
+pytest            # Test runner for all unit tests
+mplfinance        # Candlestick charts (OHLC)
