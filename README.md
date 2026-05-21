@@ -9,7 +9,15 @@ A hackathon-style project for the **IT Application in Banking and Finance** cour
 ```
 finagent/
 ├── data/
-│   ├── raw/                         ← Raw data from APIs
+│   ├── raw/                         ← Raw data organised by ticker and type
+│   │   ├── AAPL/
+│   │   │   ├── prices/              ← OHLCV price CSVs
+│   │   │   ├── financials/          ← Income, balance, cashflow CSVs
+│   │   │   └── news/                ← News sentiment CSVs
+│   │   └── shared/
+│   │       ├── commodities/         ← Commodity prices CSV
+│   │       ├── news/                ← RSS and NewsAPI headlines
+│   │       └── quota/               ← Alpha Vantage quota tracker
 │   └── processed/                   ← Cleaned, feature-engineered data
 ├── src/
 │   ├── collection/fetch_data.py     ← Yahoo Finance + NewsAPI + RSS feeds
@@ -19,10 +27,11 @@ finagent/
 │   │   ├── alpha_vantage.py         ← News sentiment + company overview
 │   │   ├── yfinance_fundamentals.py ← Income, balance sheet, cash flow (free)
 │   │   └── quota.py                 ← Alpha Vantage daily quota tracker
-│   └── analysis/ai_analysis.py      ← Groq LLM analysis functions
+│   ├── analysis/ai_analysis.py      ← Groq LLM analysis functions
+│   └── export/report_exporter.py   ← PDF report generator (analysis + charts)
 ├── reports/
 │   ├── charts/                      ← Charts organised by ticker
-│   ├── analysis/                    ← AI analysis text reports
+│   ├── analysis/                    ← AI analysis text reports + exported PDFs
 │   └── data_snapshots/              ← Summary statistics CSVs
 ├── tests/                           ← 44 unit tests (pytest)
 ├── agent.py                         ← PRIMARY entry point — interactive agent
@@ -95,6 +104,13 @@ You: quit
 Type `quota` to check your remaining Alpha Vantage daily requests.
 Type `help` to see query examples again.
 
+After every analysis, the agent will ask:
+```
+Export this analysis as a PDF report? (yes/no):
+```
+Type `yes` to generate a formatted PDF containing the full analysis text and all charts
+saved to `reports/analysis/TICKER_report_YYYY-MM-DD.pdf`. Requires Microsoft Word on Windows.
+
 ---
 
 ## Alternative: Fixed Pipeline (main.py)
@@ -147,3 +163,4 @@ All tests use synthetic data - no real API calls are made during testing.
 | Groq API 403 error | Network issue - turn on VPN and try again |
 | Yellow warnings in VS Code | `Ctrl+Shift+P` → `Python: Select Interpreter` → select the venv option |
 | `cd finagent` fails | Run `dir` to check your current folder location |
+| PDF export fails | Microsoft Word must be installed. Falls back to .docx if Word is missing |

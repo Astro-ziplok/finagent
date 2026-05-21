@@ -33,3 +33,4 @@ black             # Auto-formatter (keeps code PEP8 compliant)
 # --- Testing ---
 pytest            # Test runner for all unit tests
 mplfinance        # Candlestick charts (OHLC)
+docx2pdf          # Convert Word documents to PDF (requires MS Word on Windows)
