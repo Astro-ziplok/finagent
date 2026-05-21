@@ -59,6 +59,7 @@ from src.analysis.ai_analysis import (generate_trend_summary, generate_anomaly_c
 from src.fundamentals.alpha_vantage import fetch_all_fundamental_data, fetch_commodity_prices
 from src.fundamentals.yfinance_fundamentals import fetch_all_yfinance_fundamentals
 from src.fundamentals.quota import QuotaManager
+from src.export.report_exporter import export_report
 from src.collection.fetch_data import fetch_rss_news
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -885,7 +886,30 @@ def main():
             print("=" * 60 + "\n")
 
             saved_path = save_analysis(tickers, analysis)
-            print(f"  💾 Saved to reports/analysis/{saved_path.name}\n")
+            print(f"  Saved to reports/analysis/{saved_path.name}\n")
+
+            # ── Step 9: Offer PDF export ───────────────────────────────────
+            # Ask user if they want to export the analysis + charts as a PDF
+            print("  Export this analysis as a PDF report? (yes/no): ", end="")
+            try:
+                export_choice = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                export_choice = "no"
+
+            if export_choice in ("yes", "y"):
+                print("  Generating PDF report (this may take 15-30 seconds)...")
+                pdf_path = export_report(
+                    tickers=tickers,
+                    analysis_text=analysis,
+                    chart_paths=chart_paths,
+                )
+                if pdf_path:
+                    ext = "PDF" if pdf_path.endswith(".pdf") else "Word document"
+                    print(f"  {ext} saved: {Path(pdf_path).name}\n")
+                else:
+                    print("  Export failed. Check that python-docx is installed.\n")
+            else:
+                print()
 
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")
