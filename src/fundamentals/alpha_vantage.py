@@ -24,7 +24,8 @@ from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from config import ALPHA_VANTAGE_KEY, DATA_RAW_DIR
+from config import ALPHA_VANTAGE_KEY, DATA_RAW_DIR, \
+                   get_ticker_news_dir, get_ticker_financials_dir, get_shared_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -160,7 +161,10 @@ def fetch_news_sentiment(ticker: str, limit: int = 10) -> dict:
     # Save to CSV
     if articles:
         df = pd.DataFrame(articles)
-        df.to_csv(DATA_RAW_DIR / f"{ticker}_news_sentiment.csv", index=False)
+        # Save to organised news folder
+        # Path: data/raw/TICKER/news/TICKER_news_sentiment.csv
+        df.to_csv(get_ticker_news_dir(ticker) / f"{ticker}_news_sentiment.csv",
+                  index=False)
 
     return result
 
@@ -265,7 +269,9 @@ def fetch_company_overview(ticker: str) -> dict:
 
     # Save to JSON
     import json
-    with open(DATA_RAW_DIR / f"{ticker}_overview.json", "w") as f:
+    # Save company overview to organised financials folder
+    # Path: data/raw/TICKER/financials/TICKER_overview.json
+    with open(get_ticker_financials_dir(ticker) / f"{ticker}_overview.json", "w") as f:
         json.dump(result, f, indent=2)
 
     return result
@@ -314,7 +320,10 @@ def fetch_income_statement(ticker: str) -> dict:
     logger.info(f"  ✓ {ticker} income statement: {len(quarters)} quarters")
 
     df = pd.DataFrame(quarters)
-    df.to_csv(DATA_RAW_DIR / f"{ticker}_income_statement.csv", index=False)
+    # Save income statement to organised financials folder
+    # Path: data/raw/TICKER/financials/TICKER_income_statement.csv
+    df.to_csv(get_ticker_financials_dir(ticker) / f"{ticker}_income_statement.csv",
+              index=False)
 
     return result
 
@@ -359,7 +368,10 @@ def fetch_balance_sheet(ticker: str) -> dict:
     logger.info(f"  ✓ {ticker} balance sheet: {len(quarters)} quarters")
 
     df = pd.DataFrame(quarters)
-    df.to_csv(DATA_RAW_DIR / f"{ticker}_balance_sheet.csv", index=False)
+    # Save balance sheet to organised financials folder
+    # Path: data/raw/TICKER/financials/TICKER_balance_sheet.csv
+    df.to_csv(get_ticker_financials_dir(ticker) / f"{ticker}_balance_sheet.csv",
+              index=False)
 
     return result
 
@@ -451,11 +463,12 @@ def fetch_commodity_prices() -> dict:
                 "unit": unit, "source": "Yahoo Finance"
             }
 
-    # Save to CSV
+    # Save commodity prices to shared folder
+    # Path: data/raw/shared/commodities/commodity_prices.csv
     if results:
         df_out = pd.DataFrame(results).T
-        df_out.to_csv(DATA_RAW_DIR / "commodity_prices.csv")
-        logger.info("  💾 Commodity prices saved to data/raw/commodity_prices.csv")
+        df_out.to_csv(get_shared_dir("commodities") / "commodity_prices.csv")
+        logger.info("  💾 Commodity prices saved to data/raw/shared/commodities/")
 
     return results
 

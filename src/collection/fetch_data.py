@@ -20,7 +20,8 @@ from pathlib import Path
 # Import our project settings
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from config import TICKERS, PERIOD, INTERVAL, DATA_RAW_DIR, NEWS_API_KEY
+from config import TICKERS, PERIOD, INTERVAL, DATA_RAW_DIR, NEWS_API_KEY, \
+                   get_ticker_prices_dir, get_shared_dir
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 # This prints timestamped messages to the terminal so you can see what's happening
@@ -109,7 +110,9 @@ def fetch_stock_prices(tickers: list = None,
             logger.info(f"  ✓ {ticker}: {len(df)} rows from {df.index[0].date()} to {df.index[-1].date()}")
 
             # Save raw data to CSV
-            output_path = DATA_RAW_DIR / f"{ticker}_raw.csv"
+            # Save raw price data to organised ticker subfolder
+            # Path: data/raw/TICKER/prices/TICKER_raw.csv
+            output_path = get_ticker_prices_dir(ticker) / f"{ticker}_raw.csv"
             df.to_csv(output_path)
             logger.info(f"  💾 Saved to {output_path}")
 
@@ -191,7 +194,9 @@ def fetch_financial_news(tickers: list[str] = TICKERS,
     df["published_at"] = pd.to_datetime(df["published_at"])
 
     # Save to CSV
-    output_path = DATA_RAW_DIR / "news_raw.csv"
+    # Save news data to shared news folder
+    # Path: data/raw/shared/news/news_raw.csv
+    output_path = get_shared_dir("news") / "news_raw.csv"
     df.to_csv(output_path, index=False)
     logger.info(f"\n💾 News data saved to {output_path} ({len(df)} articles total)")
 
@@ -328,7 +333,9 @@ def fetch_rss_news(tickers: list = None, max_articles: int = 5) -> pd.DataFrame:
     df = pd.DataFrame(all_articles)
 
     # Save to CSV
-    output_path = DATA_RAW_DIR / "rss_news.csv"
+    # Save RSS news to shared news folder
+    # Path: data/raw/shared/news/rss_news.csv
+    output_path = get_shared_dir("news") / "rss_news.csv"
     df.to_csv(output_path, index=False)
     logger.info(f"\n💾 RSS news saved to {output_path} ({len(df)} articles)")
 

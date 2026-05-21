@@ -21,7 +21,7 @@ from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from config import DATA_RAW_DIR
+from config import DATA_RAW_DIR, get_ticker_financials_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -152,9 +152,12 @@ def fetch_income_statement(ticker: str) -> dict:
         }
 
         # Save to CSV
+        # Save to organised financials folder
+        # Path: data/raw/TICKER/financials/TICKER_income_annual.csv
         if annual_rows:
             pd.DataFrame(annual_rows).to_csv(
-                DATA_RAW_DIR / f"{ticker}_income_annual.csv", index=False)
+                get_ticker_financials_dir(ticker) / f"{ticker}_income_annual.csv",
+                index=False)
 
         logger.info(f"  ✓ {ticker} income statement: {len(annual_rows)} annual, "
                     f"{len(quarterly_rows)} quarterly periods")
@@ -243,9 +246,12 @@ def fetch_balance_sheet(ticker: str) -> dict:
             "source":    "Yahoo Finance (yfinance)",
         }
 
+        # Save to organised financials folder
+        # Path: data/raw/TICKER/financials/TICKER_balance_annual.csv
         if annual_rows:
             pd.DataFrame(annual_rows).to_csv(
-                DATA_RAW_DIR / f"{ticker}_balance_annual.csv", index=False)
+                get_ticker_financials_dir(ticker) / f"{ticker}_balance_annual.csv",
+                index=False)
 
         logger.info(f"  ✓ {ticker} balance sheet: {len(annual_rows)} annual periods")
         return result
@@ -335,9 +341,12 @@ def fetch_cash_flow(ticker: str) -> dict:
             "source":     "Yahoo Finance (yfinance)",
         }
 
+        # Save to organised financials folder
+        # Path: data/raw/TICKER/financials/TICKER_cashflow_annual.csv
         if annual_rows:
             pd.DataFrame(annual_rows).to_csv(
-                DATA_RAW_DIR / f"{ticker}_cashflow_annual.csv", index=False)
+                get_ticker_financials_dir(ticker) / f"{ticker}_cashflow_annual.csv",
+                index=False)
 
         logger.info(f"  ✓ {ticker} cash flow: {len(annual_rows)} annual periods | "
                     f"FCF growth: {fcf_growth}%")

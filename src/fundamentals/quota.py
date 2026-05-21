@@ -15,7 +15,7 @@ from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from config import DATA_RAW_DIR
+from config import DATA_RAW_DIR, get_shared_dir
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,9 @@ COST = {
     "balance":  1,   # BALANCE_SHEET endpoint
 }
 
-QUOTA_FILE = DATA_RAW_DIR / "av_quota.json"
+# Quota file stored in shared/quota/ subfolder
+# Path: data/raw/shared/quota/av_quota.json
+QUOTA_FILE = get_shared_dir("quota") / "av_quota.json"
 
 
 class QuotaManager:

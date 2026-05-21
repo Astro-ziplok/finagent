@@ -28,6 +28,65 @@ REPORTS_DATA_DIR    = REPORTS_DIR / "data_snapshots" # reports/data_snapshots/
 for folder in [DATA_RAW_DIR, DATA_PROC_DIR, REPORTS_DIR,
                REPORTS_CHARTS_DIR, REPORTS_ANALYSIS_DIR, REPORTS_DATA_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
+# ── Organised Raw Data Structure ─────────────────────────────────────────────
+# Raw data is now organised into subfolders per ticker and data type:
+#   data/raw/AAPL/prices/AAPL_raw.csv
+#   data/raw/AAPL/financials/AAPL_income_annual.csv
+#   data/raw/AAPL/financials/AAPL_balance_annual.csv
+#   data/raw/AAPL/financials/AAPL_cashflow_annual.csv
+#   data/raw/AAPL/news/AAPL_news_sentiment.csv
+#   data/raw/shared/commodities/commodity_prices.csv
+#   data/raw/shared/news/rss_news.csv
+#   data/raw/shared/quota/av_quota.json
+ 
+def get_ticker_prices_dir(ticker: str) -> Path:
+    """
+    Returns the folder path for a ticker's price data.
+    Creates the folder automatically if it does not exist.
+    Example: data/raw/AAPL/prices/
+    """
+    d = DATA_RAW_DIR / ticker / "prices"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+ 
+ 
+def get_ticker_financials_dir(ticker: str) -> Path:
+    """
+    Returns the folder path for a ticker's financial statement data.
+    Creates the folder automatically if it does not exist.
+    Example: data/raw/AAPL/financials/
+    Stores: income_annual.csv, balance_annual.csv, cashflow_annual.csv,
+            overview.json, income_statement.csv, balance_sheet.csv
+    """
+    d = DATA_RAW_DIR / ticker / "financials"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+ 
+ 
+def get_ticker_news_dir(ticker: str) -> Path:
+    """
+    Returns the folder path for a ticker's news and sentiment data.
+    Creates the folder automatically if it does not exist.
+    Example: data/raw/AAPL/news/
+    Stores: news_sentiment.csv
+    """
+    d = DATA_RAW_DIR / ticker / "news"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+ 
+ 
+def get_shared_dir(category: str) -> Path:
+    """
+    Returns the folder path for shared (non-ticker-specific) data.
+    Creates the folder automatically if it does not exist.
+    Example: data/raw/shared/commodities/
+             data/raw/shared/news/
+             data/raw/shared/quota/
+    Categories: 'commodities', 'news', 'quota'
+    """
+    d = DATA_RAW_DIR / "shared" / category
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 # ── Assets to Track ───────────────────────────────────────────────────────────
 TICKERS = ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN"]
