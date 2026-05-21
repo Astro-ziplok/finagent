@@ -34,8 +34,8 @@ finagent/
 │   ├── analysis/                    ← AI analysis text reports + exported PDFs
 │   └── data_snapshots/              ← Summary statistics CSVs
 ├── tests/                           ← 44 unit tests (pytest)
-├── agent.py                         ← PRIMARY entry point — interactive agent
-├── main.py                          ← Alternative — fixed batch pipeline
+├── agent.py                         ← PRIMARY entry point - interactive agent
+├── main.py                          ← Alternative - fixed batch pipeline
 ├── config.py                        ← Global settings (tickers, paths, keys)
 ├── requirements.txt                 ← All dependencies
 └── .env.example                     ← API key template
@@ -45,25 +45,105 @@ finagent/
 
 ## Quick Start
 
-Run these three commands every session:
+> If you have never used Python or a terminal before, follow every step in order. Do not skip any step.
+
+### Step 1 - Make sure Python is installed
+
+Open your terminal (search "PowerShell" on Windows) and type:
 
 ```bash
-# 1. Navigate into the project
-cd finagent
-
-# 2. Activate virtual environment
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # Mac / Linux
-
-# 3. Run the agent
-python agent.py
+python --version
 ```
 
-First time only - install dependencies and set up API keys:
+You should see something like `Python 3.13.x`. If you see an error, download Python from [python.org](https://www.python.org/downloads/) and tick **"Add Python to PATH"** during installation.
+
+---
+
+### Step 2 - Download the project
+
+```bash
+git clone https://github.com/Astro-ziplok/finagent.git
+cd finagent
+```
+
+If you do not have Git, download it from [git-scm.com](https://git-scm.com/downloads).
+
+---
+
+### Step 3 - Create a virtual environment
+
+A virtual environment is an isolated space where Python packages are installed for this project only. It prevents conflicts with other projects on your computer.
+
+```bash
+python -m venv venv
+```
+
+You only need to do this **once**. A new folder called `venv/` will appear in the project.
+
+---
+
+### Step 4 - Activate the virtual environment
+
+You must activate the venv **every time** you open a new terminal before running the project.
+
+```bash
+venv\Scripts\activate        # Windows
+source venv/bin/activate     # Mac / Linux
+```
+
+When activated correctly, your terminal prompt will show `(venv)` at the start:
+
+```
+(venv) PS C:\Users\YourName\finagent>
+```
+
+If you do not see `(venv)`, the venv is not active. Run the activate command again before continuing.
+
+---
+
+### Step 5 - Install all dependencies (first time only)
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env         # then open .env and fill in your keys
+```
+
+This installs all required Python libraries. It may take 2-5 minutes depending on your internet speed. You only need to do this once.
+
+---
+
+### Step 6 - Set up your API keys
+
+```bash
+copy .env.example .env        # Windows
+cp .env.example .env          # Mac / Linux
+```
+
+Open the new `.env` file in VS Code and fill in your API keys:
+
+```
+GROQ_API_KEY=your_groq_key_here
+ALPHA_VANTAGE_KEY=your_alpha_vantage_key_here
+NEWS_API_KEY=your_newsapi_key_here
+
+---
+
+### Step 7 - Run the agent
+
+```bash
+python agent.py
+```
+
+You should see the FinAgent banner and a `You:` prompt. Type any financial question to begin.
+
+---
+
+### Every time you come back
+
+You only need Steps 4 and 7 for every new session:
+
+```bash
+venv\Scripts\activate        # Step 4 - activate venv
+python agent.py              # Step 7 - run the agent
 ```
 
 ---
