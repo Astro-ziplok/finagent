@@ -97,7 +97,25 @@ When activated correctly, your terminal prompt will show `(venv)` at the start:
 (venv) PS C:\Users\YourName\finagent>
 ```
 
-If you do not see `(venv)`, the venv is not active. Run the activate command again before continuing.
+**If you do not see `(venv)`, do not continue.** Run the activate command again before proceeding.
+
+**Windows only - if you see a red error about "running scripts is disabled on this system"**, follow these steps:
+
+1. Close VS Code. Open **"PowerShell"** in the Window Start menu.
+2. Run this command:
+```bash
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+3. Verify it worked by running:
+```bash
+Get-ExecutionPolicy
+```
+It should return `RemoteSigned`. This fix is permanent for your user account and only needs to be done once.
+
+4. Go back to your project terminal and run the activate command again:
+```bash
+venv\Scripts\activate
+```
 
 ---
 
