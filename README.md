@@ -119,15 +119,15 @@ cp .env.example .env          # Mac / Linux
 ```
 
 Open the new `.env` file in VS Code and fill in your API keys:
-
-```
+```bash
 GROQ_API_KEY=your_groq_key_here
 ALPHA_VANTAGE_KEY=your_alpha_vantage_key_here
-NEWS_API_KEY=your_newsapi_key_here
+NEWS_API_KEY=your_newsapi_key_here   # Optional, the agent runs fine without it
+```
 
 ---
 
-### Step 7 - Run the agent
+### Step 7 - run the agent
 
 ```bash
 python agent.py
