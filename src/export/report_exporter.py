@@ -88,8 +88,15 @@ def _parse_sections(analysis_text: str) -> list:
     current_body  = []
 
     for line in analysis_text.split("\n"):
-        # Detect section divider lines like "── NVDA TREND ANALYSIS ──────"
-        if line.strip().startswith("──") or line.strip().startswith("=="):
+        stripped = line.strip()
+        # Detect section divider lines: "── NVDA TREND ANALYSIS ──────" (main.py)
+        # or "-- NVDA TREND ANALYSIS --" (agent.py). The agent's ASCII form was
+        # previously not recognised, so PDFs had no section headings.
+        is_ascii_header = (stripped.startswith("-- ") and stripped.endswith(" --")
+                           and len(stripped) > 6)
+        if stripped.startswith("──") or stripped.startswith("==") or is_ascii_header:
+            if is_ascii_header:
+                line = stripped[3:-3]
             # Save previous section if it has content
             if current_body:
                 body_text = "\n".join(current_body).strip()
@@ -240,7 +247,16 @@ def export_report(tickers: list,
                 para_text = para_text.strip()
                 if not para_text:
                     continue
-                p = doc.add_paragraph(para_text)
+                # LLM sub-headers come as "**Header**" lines: render them as
+                # bold headings instead of literal asterisks.
+                lines = para_text.split("\n")
+                first = lines[0].strip()
+                if first.startswith("**") and first.endswith("**") and len(first) > 4:
+                    doc.add_heading(first.strip("*").strip(), level=3)
+                    para_text = "\n".join(lines[1:]).strip()
+                    if not para_text:
+                        continue
+                p = doc.add_paragraph(para_text.replace("**", ""))
                 p.paragraph_format.space_after  = Pt(6)
                 p.paragraph_format.space_before = Pt(2)
 

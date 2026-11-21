@@ -284,19 +284,24 @@ def plot_fundamental_ratios(fundamental_data: dict) -> str:
         ov = data["overview"]
         if not ov:
             continue
+        def pct(v):
+            return round(v * 100, 2) if v is not None else float("nan")
+        # Missing values stay NaN (shown as "n/a"), never a misleading 0
         rows.append({
             "ticker": ticker,
-            "P/E Ratio": ov.get("pe_ratio") or 0,
-            "ROE (%)":   round((ov.get("roe") or 0) * 100, 2),
-            "ROA (%)":   round((ov.get("roa") or 0) * 100, 2),
-            "D/E Ratio": ov.get("debt_to_equity") or 0,
+            "P/E Ratio": ov.get("pe_ratio") if ov.get("pe_ratio") is not None else float("nan"),
+            "ROE (%)":   pct(ov.get("roe")),
+            "ROA (%)":   pct(ov.get("roa")),
+            "D/E Ratio": ov.get("debt_to_equity") if ov.get("debt_to_equity") is not None else float("nan"),
         })
 
     if not rows:
         return ""
 
     df = pd.DataFrame(rows).set_index("ticker")
-    metrics = [c for c in df.columns if df[c].sum() != 0]
+    metrics = [c for c in df.columns if df[c].notna().any()]
+    if not metrics:
+        return ""
 
     fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 5))
     if len(metrics) == 1:
@@ -306,16 +311,18 @@ def plot_fundamental_ratios(fundamental_data: dict) -> str:
 
     for i, metric in enumerate(metrics):
         ax = axes[i]
-        bars = ax.bar(df.index, df[metric], color=colors[:len(df)], alpha=0.8, edgecolor="black", linewidth=0.5)
+        vals = df[metric]
+        bars = ax.bar(df.index, vals.fillna(0), color=colors[:len(df)], alpha=0.8, edgecolor="black", linewidth=0.5)
         ax.set_title(metric, fontweight="bold", fontsize=12)
         ax.set_ylabel(metric)
         ax.grid(True, alpha=0.3, axis="y")
 
-        # Add value labels on top of each bar
-        for bar in bars:
+        # Add value labels on top of each bar ("n/a" where data is missing)
+        for bar, v in zip(bars, vals):
             h = bar.get_height()
+            label = "n/a" if pd.isna(v) else f"{v:.2f}"
             ax.text(bar.get_x() + bar.get_width() / 2, h + 0.01 * abs(h),
-                    f"{h:.2f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+                    label, ha="center", va="bottom", fontsize=9, fontweight="bold")
 
     plt.suptitle("Fundamental Ratios Comparison", fontsize=14, fontweight="bold")
     plt.tight_layout()
@@ -585,13 +592,16 @@ def plot_comparison_valuation_radar(yf_data: dict, cdir: "Path" = None) -> str:
         grow = m.get("growth", {}) or {}
         prof = m.get("profitability", {}) or {}
 
+        def nv(v):
+            return v if v is not None else float("nan")
+        # NaN (shown as "n/a") instead of 0: a loss-maker has no P/E, not a P/E of 0
         rows.append({
-            "ticker":            ticker,
-            "P/E (trailing)":    val.get("pe_trailing") or 0,
-            "EPS Growth (%)":    earn.get("eps_growth_pct") or 0,
-            "Revenue Growth (%)":grow.get("revenue_yoy_pct") or 0,
-            "Net Margin (%)":    prof.get("profit_margin_pct") or 0,
-            "FCF Yield (%)":     prof.get("fcf_yield_pct") or 0,
+            "ticker":              ticker,
+            "P/E (trailing)":      nv(val.get("pe_trailing")),
+            "Exp. EPS Growth (%)": nv(earn.get("eps_growth_pct")),
+            "Revenue Growth (%)":  nv(grow.get("revenue_yoy_pct")),
+            "Net Margin (%)":      nv(prof.get("profit_margin_pct")),
+            "FCF Yield (%)":       nv(prof.get("fcf_yield_pct")),
         })
 
     if not rows or len(rows) < 2:
@@ -610,15 +620,16 @@ def plot_comparison_valuation_radar(yf_data: dict, cdir: "Path" = None) -> str:
 
     for i, metric in enumerate(metrics):
         ax = axes[i]
-        vals = df[metric].tolist()
+        raw  = df[metric].tolist()
+        vals = [0 if pd.isna(v) else v for v in raw]
         bars = ax.bar(tickers, vals,
                       color=colors[:len(tickers)], alpha=0.85,
                       edgecolor="black", linewidth=0.5)
 
-        for bar, v in zip(bars, vals):
+        for bar, v, r in zip(bars, vals, raw):
             ax.text(bar.get_x() + bar.get_width() / 2,
                     v + abs(v) * 0.03 if v >= 0 else v - abs(v) * 0.08,
-                    f"{v:.1f}",
+                    "n/a" if pd.isna(r) else f"{v:.1f}",
                     ha="center", va="bottom" if v >= 0 else "top",
                     fontsize=9, fontweight="bold")
 

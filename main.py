@@ -22,9 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import TICKERS, REPORTS_ANALYSIS_DIR, REPORTS_CHARTS_DIR, REPORTS_DIR
-from src.collection.fetch_data import collect_all_data
-from src.cleaning.clean_data import clean_all_stocks, get_summary_stats
+from config import (TICKERS, REPORTS_ANALYSIS_DIR, REPORTS_CHARTS_DIR, REPORTS_DIR,
+                    BENCHMARK_TICKER)
+from src.collection.fetch_data import collect_all_data, fetch_stock_prices
+from src.cleaning.clean_data import clean_all_stocks, get_summary_stats, clean_stock_dataframe
 from src.visualization.charts import generate_all_charts
 from src.analysis.ai_analysis import (
     _build_data_context,
@@ -32,6 +33,7 @@ from src.analysis.ai_analysis import (
     generate_anomaly_commentary,
     generate_risk_commentary,
     generate_comparative_analysis,
+    DISCLAIMER,
 )
 
 logging.basicConfig(
@@ -94,7 +96,13 @@ def main():
     print("\nSTEP 4: AI ANALYSIS")
     print("-" * 40)
 
-    context  = _build_data_context(cleaned_data)
+    # Market benchmark (SPY) so returns can be judged against the market
+    benchmark_df = None
+    bench_raw = fetch_stock_prices([BENCHMARK_TICKER])
+    if BENCHMARK_TICKER in bench_raw:
+        benchmark_df = clean_stock_dataframe(bench_raw[BENCHMARK_TICKER], BENCHMARK_TICKER)
+
+    context  = _build_data_context(cleaned_data, benchmark_df=benchmark_df)
     sections = []
 
     # Report header
@@ -127,6 +135,7 @@ def main():
     sections.append("\n\n── COMPARATIVE ANALYSIS ─────────────────────────────────────────────\n")
     print("  Generating comparative analysis...")
     sections.append(generate_comparative_analysis(context))
+    sections.append("\n\n" + DISCLAIMER)
 
     # ── Step 5: Save Report ───────────────────────────────────────────────────
     print("\nSTEP 5: SAVING REPORT")
@@ -142,7 +151,7 @@ def main():
     print("🤖 AI ANALYSIS PREVIEW (first ticker)")
     print("=" * 65)
     first = list(cleaned_data.keys())[0]
-    trend = generate_trend_summary(first, context)
+    trend = sections[sections.index(f"[ {first} ]") + 1]
     # Print first 20 lines of the trend summary as preview
     preview_lines = trend.split("\n")[:20]
     print("\n".join(preview_lines))

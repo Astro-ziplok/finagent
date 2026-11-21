@@ -15,47 +15,151 @@ This module produces (all required by the rubric + extras):
 
 import json
 import logging
+import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from openai import OpenAI
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from config import GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL, MAX_TOKENS, REPORTS_DIR
+from config import (GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL, MAX_TOKENS, REPORTS_DIR,
+                    RISK_FREE_RATE, TRADING_DAYS, BENCHMARK_TICKER,
+                    REASONING_TOKEN_BUFFER, GROQ_EXTRA_BODY)
+
+# Shared rule appended to every system prompt: numbers and comparisons are
+# pre-computed in Python, so the LLM must not redo arithmetic or flip directions.
+NUMERIC_RULES = """
+Numeric rules (mandatory):
+- Every comparison, ranking and direction (higher/lower, increased/decreased, beat/lagged)
+  is already computed for you in fields such as *_direction, *_ranking, strongest_*,
+  outperformed_*, or *_interpretation. Repeat those conclusions; never recompute or contradict them.
+- Ratios ending in _x are multiples (0.8x), fields ending in _pct are percentages.
+- Sharpe ratios are ANNUALISED: below 0.5 is weak, 0.5-1 moderate, 1-2 good, above 2 very strong.
+- If a value is null/None, say it is not available. Do not estimate it.
+"""
+
+DISCLAIMER = ("Disclaimer: This report is generated automatically for educational purposes "
+              "only and is not investment advice.")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def _build_data_context(cleaned_data: dict) -> dict:
+def _annualised_sharpe(returns_pct: pd.Series) -> float:
+    """
+    Annualised Sharpe ratio from daily % returns.
+    Formula: (mean daily return - daily risk-free rate) / daily std * sqrt(252)
+    """
+    r = returns_pct.dropna() / 100
+    if len(r) < 2 or r.std() == 0:
+        return 0.0
+    rf_daily = (1 + RISK_FREE_RATE) ** (1 / TRADING_DAYS) - 1
+    return round(float((r.mean() - rf_daily) / r.std() * np.sqrt(TRADING_DAYS)), 2)
+
+
+def _sharpe_label(sharpe: float) -> str:
+    """Plain-English interpretation of an annualised Sharpe ratio."""
+    if sharpe < 0:
+        return "negative: the stock returned less than the risk-free rate"
+    if sharpe < 0.5:
+        return "weak risk-adjusted return"
+    if sharpe < 1.0:
+        return "moderate risk-adjusted return"
+    if sharpe < 2.0:
+        return "good risk-adjusted return"
+    if sharpe < 3.0:
+        return "very strong risk-adjusted return"
+    return "exceptional risk-adjusted return (rarely sustained over long periods)"
+
+
+def _pct_over(close: pd.Series, n_days: int):
+    """% change over the last n trading days (None if not enough data)."""
+    if len(close) <= n_days:
+        return None
+    return round((float(close.iloc[-1]) / float(close.iloc[-1 - n_days]) - 1) * 100, 2)
+
+
+def _calendar_breakdown(df: pd.DataFrame, freq: str, max_periods: int) -> list:
+    """
+    Calendar-period (quarter or year) performance breakdown.
+    Each period's return is measured from the PREVIOUS period's last close,
+    so period returns chain together correctly. Periods with too few trading
+    days are flagged as partial.
+    """
+    close = df["Close"]
+    groups = list(df.groupby(df.index.to_period(freq)))
+    full_len = 60 if freq == "Q" else 240
+    rows = []
+    prev_close = None
+    for period, chunk in groups:
+        if chunk.empty:
+            continue
+        base = prev_close if prev_close is not None else float(chunk["Close"].iloc[0])
+        end  = float(chunk["Close"].iloc[-1])
+        rows.append({
+            "period":           str(period).replace("Q", "-Q") if freq == "Q" else str(period),
+            "start_date":       str(chunk.index[0].date()),
+            "end_date":         str(chunk.index[-1].date()),
+            "start_price":      round(base, 2),
+            "end_price":        round(end, 2),
+            "pct_change":       round((end / base - 1) * 100, 2),
+            "trading_days":     len(chunk),
+            "partial_period":   len(chunk) < full_len,
+            "avg_daily_volume": int(chunk["Volume"].mean()),
+        })
+        prev_close = end
+    return rows[-max_periods:]
+
+
+def _benchmark_stats(df: pd.DataFrame, bench_df: pd.DataFrame) -> dict:
+    """Compare a stock to a market benchmark over the overlapping dates."""
+    joined = pd.concat(
+        [df["Close"].rename("stock"), bench_df["Close"].rename("bench")], axis=1
+    ).dropna()
+    if len(joined) < 20:
+        return {}
+    rets = joined.pct_change().dropna()
+    stock_ret = (joined["stock"].iloc[-1] / joined["stock"].iloc[0] - 1) * 100
+    bench_ret = (joined["bench"].iloc[-1] / joined["bench"].iloc[0] - 1) * 100
+    beta = rets["stock"].cov(rets["bench"]) / rets["bench"].var() if rets["bench"].var() else None
+    corr = rets["stock"].corr(rets["bench"])
+    return {
+        "benchmark":                BENCHMARK_TICKER,
+        "benchmark_return_pct":     round(float(bench_ret), 2),
+        "stock_return_pct":         round(float(stock_ret), 2),
+        "excess_return_pct":        round(float(stock_ret - bench_ret), 2),
+        "outperformed_benchmark":   bool(stock_ret > bench_ret),
+        "beta_vs_benchmark":        round(float(beta), 2) if beta is not None else None,
+        "beta_basis":               "daily returns over this period (can differ from Yahoo's 5-year monthly beta)",
+        "correlation_vs_benchmark": round(float(corr), 2),
+        "benchmark_sharpe_annualised": _annualised_sharpe(rets["bench"] * 100),
+    }
+
+
+def _build_data_context(cleaned_data: dict, benchmark_df: pd.DataFrame = None) -> dict:
     """
     Extract a rich, structured JSON-serialisable summary of the data.
-    Includes quarterly breakdown, MA signals, Bollinger Bands,
-    win rate, Sharpe ratio, and multi-window momentum.
+    Includes calendar-quarter breakdown, MA signals, Bollinger Bands,
+    win rate, annualised Sharpe ratio, multi-window momentum and
+    (optionally) performance versus a market benchmark such as SPY.
     """
     context = {}
 
     for ticker, df in cleaned_data.items():
         returns   = df["Daily_Return"].dropna()
-        recent_7  = df.tail(7)
         recent_30 = df.tail(30)
-        recent_90 = df.tail(90)
+        close     = df["Close"]
 
-        # Quarter-by-quarter breakdown
-        quarterly = []
-        for q in range(4):
-            chunk = df.iloc[q * 63:(q + 1) * 63]
-            if len(chunk) > 5:
-                quarterly.append({
-                    "quarter":          f"Q{q + 1}",
-                    "start_date":       str(chunk.index[0].date()),
-                    "end_date":         str(chunk.index[-1].date()),
-                    "open_price":       round(float(chunk["Close"].iloc[0]), 2),
-                    "close_price":      round(float(chunk["Close"].iloc[-1]), 2),
-                    "pct_change":       round((chunk["Close"].iloc[-1] / chunk["Close"].iloc[0] - 1) * 100, 2),
-                    "avg_daily_volume": int(chunk["Volume"].mean()),
-                })
+        # Calendar-quarter breakdown (last 8 quarters) + yearly for long ranges
+        quarterly = _calendar_breakdown(df, "Q", max_periods=8)
+        span_days = (df.index[-1] - df.index[0]).days
+        yearly    = _calendar_breakdown(df, "Y", max_periods=10) if span_days > 550 else []
+
+        full_quarters = [q for q in quarterly if not q["partial_period"]] or quarterly
+        best_q  = max(full_quarters, key=lambda q: q["pct_change"]) if full_quarters else None
+        worst_q = min(full_quarters, key=lambda q: q["pct_change"]) if full_quarters else None
 
         # Moving average signal
         current_price = float(df["Close"].iloc[-1])
@@ -91,39 +195,58 @@ def _build_data_context(cleaned_data: dict) -> dict:
         else:
             bb_signal = "Insufficient data for Bollinger Band signal"
 
-        sharpe_approx = round(returns.mean() / returns.std(), 4) if returns.std() != 0 else 0
-        win_rate      = round((returns > 0).sum() / len(returns) * 100, 1)
+        sharpe   = _annualised_sharpe(returns)
+        win_rate = round((returns > 0).sum() / len(returns) * 100, 1)
+
+        # Label the high/low honestly: it is only a "52-week" figure for ~1y of data
+        is_one_year  = 330 <= span_days <= 400
+        range_label  = "52-week" if is_one_year else f"period ({df.index[0].date()} to {df.index[-1].date()})"
+        period_high  = float(df["High"].max())
+        period_low   = float(df["Low"].min())
+
+        daily_std    = float(returns.std())
+        annual_vol   = round(daily_std * np.sqrt(TRADING_DAYS), 2)
+        recent_vol   = round(float(recent_30["Daily_Return"].std()), 3)
+        m7, m30, m90 = _pct_over(close, 7), _pct_over(close, 30), _pct_over(close, 90)
 
         context[ticker] = {
             "period": {
                 "start":        str(df.index[0].date()),
                 "end":          str(df.index[-1].date()),
                 "trading_days": len(df),
+                "is_one_year":  is_one_year,
             },
-            "full_year_price": {
-                "start_price":        round(float(df["Close"].iloc[0]), 2),
-                "end_price":          round(float(df["Close"].iloc[-1]), 2),
-                "52w_high":           round(float(df["High"].max()), 2),
-                "52w_low":            round(float(df["Low"].min()), 2),
-                "total_return_pct":   round((df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100, 2),
-                "pct_below_52w_high": round((current_price / float(df["High"].max()) - 1) * 100, 2),
-                "pct_above_52w_low":  round((current_price / float(df["Low"].min()) - 1) * 100, 2),
+            "price_summary": {
+                "start_price":          round(float(close.iloc[0]), 2),
+                "end_price":            round(float(close.iloc[-1]), 2),
+                "high_low_label":       range_label,
+                "period_high":          round(period_high, 2),
+                "period_low":           round(period_low, 2),
+                "total_return_pct":     round((close.iloc[-1] / close.iloc[0] - 1) * 100, 2),
+                "pct_below_period_high": round((current_price / period_high - 1) * 100, 2),
+                "pct_above_period_low":  round((current_price / period_low - 1) * 100, 2),
             },
             "returns": {
-                "mean_daily_pct":      round(float(returns.mean()), 3),
-                "std_daily_pct":       round(float(returns.std()), 3),
-                "best_day_pct":        round(float(returns.max()), 2),
-                "best_day_date":       str(returns.idxmax().date()),
-                "worst_day_pct":       round(float(returns.min()), 2),
-                "worst_day_date":      str(returns.idxmin().date()),
-                "win_rate_pct":        win_rate,
-                "sharpe_ratio_approx": sharpe_approx,
+                "mean_daily_pct":          round(float(returns.mean()), 3),
+                "std_daily_pct":           round(daily_std, 3),
+                "annualised_volatility_pct": annual_vol,
+                "best_day_pct":            round(float(returns.max()), 2),
+                "best_day_date":           str(returns.idxmax().date()),
+                "worst_day_pct":           round(float(returns.min()), 2),
+                "worst_day_date":          str(returns.idxmin().date()),
+                "win_rate_pct":            win_rate,
+                "sharpe_ratio_annualised": sharpe,
+                "sharpe_interpretation":   _sharpe_label(sharpe),
+                "risk_free_rate_used_pct": round(RISK_FREE_RATE * 100, 2),
             },
             "short_term_momentum": {
-                "last_7d_change_pct":  round((recent_7["Close"].iloc[-1]  / recent_7["Close"].iloc[0]  - 1) * 100, 2),
-                "last_30d_change_pct": round((recent_30["Close"].iloc[-1] / recent_30["Close"].iloc[0] - 1) * 100, 2),
-                "last_90d_change_pct": round((recent_90["Close"].iloc[-1] / recent_90["Close"].iloc[0] - 1) * 100, 2),
-                "last_30d_volatility": round(float(recent_30["Daily_Return"].std()), 3),
+                "last_7d_change_pct":  m7,
+                "last_30d_change_pct": m30,
+                "last_90d_change_pct": m90,
+                "last_30d_volatility": recent_vol,
+                "recent_volatility_vs_full_period": (
+                    "higher" if recent_vol > daily_std else "lower"
+                ),
                 "last_30d_avg_volume": int(recent_30["Volume"].mean()),
             },
             "technical_signals": {
@@ -137,8 +260,16 @@ def _build_data_context(cleaned_data: dict) -> dict:
                 "bb_signal":     bb_signal,
             },
             "quarterly_breakdown": quarterly,
+            "strongest_quarter":   best_q["period"] if best_q else None,
+            "weakest_quarter":     worst_q["period"] if worst_q else None,
+            "yearly_breakdown":    yearly,
             "outlier_dates": df[df["Is_Outlier"] == True].index.strftime("%Y-%m-%d").tolist(),
         }
+
+        if benchmark_df is not None and not benchmark_df.empty and ticker != BENCHMARK_TICKER:
+            bench = _benchmark_stats(df, benchmark_df)
+            if bench:
+                context[ticker]["vs_benchmark"] = bench
 
     return context
 
@@ -149,22 +280,37 @@ def _call_groq(prompt: str, system_prompt: str = "", max_tokens: int = MAX_TOKEN
         return "⚠️  GROQ_API_KEY not set in .env file. Skipping AI analysis."
 
     client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
+    messages = [{"role": "system", "content": (system_prompt or "") + NUMERIC_RULES},
+                {"role": "user", "content": prompt}]
 
-    try:
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.3,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Groq API error: {e}")
-        return f"⚠️  Groq API call failed: {e}"
+    # Retry with exponential backoff: the Groq free tier rate-limits bursts
+    # of requests, and a "full" report makes 10+ calls in a row.
+    last_error = None
+    for attempt in range(4):
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                max_tokens=max_tokens + (REASONING_TOKEN_BUFFER if GROQ_EXTRA_BODY else 0),
+                temperature=0.2,
+                extra_body=GROQ_EXTRA_BODY or None,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            if not content:
+                raise RuntimeError("empty response (token budget used up by reasoning)")
+            return content
+        except Exception as e:
+            last_error = e
+            msg = str(e).lower()
+            retryable = any(s in msg for s in ("429", "rate limit", "timeout", "503", "502",
+                                               "empty response"))
+            if not retryable or attempt == 3:
+                break
+            wait = 2 ** (attempt + 1)
+            logger.warning(f"Groq rate-limited/unavailable, retrying in {wait}s...")
+            time.sleep(wait)
+    logger.error(f"Groq API error: {last_error}")
+    return f"⚠️  Groq API call failed: {last_error}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,29 +345,34 @@ DATA:
 Write your analysis using EXACTLY these section headers:
 
 **1. Overall Performance**
-Summarise the full-year return (use total_return_pct). State the start and end price.
-Compare to the 52-week high and low — how far is the current price from each?
+Summarise the return over the period (total_return_pct). State the start and end price.
+Compare to the high and low, calling them by high_low_label (only say "52-week" if that is the label).
+If vs_benchmark is present, state the benchmark return and excess_return_pct, and whether the stock
+outperformed (use outperformed_benchmark).
 
 **2. Quarterly Breakdown**
-Walk through each quarter's performance using the quarterly_breakdown data.
-Identify which quarter was strongest and which was weakest, with exact figures.
+Walk through each calendar quarter in quarterly_breakdown (use the period labels, e.g. 2025-Q3).
+Name strongest_quarter and weakest_quarter with their pct_change. Mention if a quarter is a partial_period.
+If yearly_breakdown is non-empty, summarise the year-by-year returns briefly.
 
 **3. Short-Term Momentum**
 Discuss the 7-day, 30-day, and 90-day price changes from short_term_momentum.
 Is the stock accelerating or decelerating recently?
 
 **4. Technical Signal**
-State the current moving average signal (ma_signal) and what it implies.
-State the Bollinger Band signal (bb_signal) and what it suggests about near-term direction.
+State the moving average signal (ma_signal) and the Bollinger Band signal (bb_signal).
+Note that these are short-term indicators: price can stay near a Bollinger band during strong trends,
+so present them as context rather than predictions.
 
 **5. Risk & Return Profile**
-Use win_rate_pct, best_day_pct with its date, worst_day_pct with its date, and sharpe_ratio_approx.
-Comment on what the win rate and Sharpe ratio suggest about the stock's consistency.
+Use annualised_volatility_pct, win_rate_pct, best_day_pct and worst_day_pct with their dates,
+and sharpe_ratio_annualised with its sharpe_interpretation (risk-free rate: risk_free_rate_used_pct).
+If vs_benchmark is present, mention beta_vs_benchmark (above 1 = moves more than the market).
 
 **6. Investment Implication**
 Based on ALL the sections above, write 2-3 sentences answering: "So what does this mean for an investor?"
-State clearly whether this stock currently looks more suitable for a risk-tolerant or risk-averse investor.
-Reference at least 2 specific numbers from the data to justify your conclusion.
+State whether the risk profile looks more suitable for a risk-tolerant or risk-averse investor.
+Reference at least 2 specific numbers from the data. Do not give a buy/sell recommendation.
 """
     return _call_groq(prompt, system_prompt, max_tokens=1500)
 
@@ -235,48 +386,48 @@ def generate_market_context(ticker: str, data_context: dict) -> str:
     stats = data_context[ticker]
     period_start = stats["period"]["start"]
     period_end   = stats["period"]["end"]
-    total_return = stats["full_year_price"]["total_return_pct"]
+    total_return = stats["price_summary"]["total_return_pct"]
     best_date    = stats["returns"]["best_day_date"]
     worst_date   = stats["returns"]["worst_day_date"]
     outliers     = stats["outlier_dates"]
 
+    # The LLM's training data ends before the analysis period, so this section
+    # must stay at the level of durable background knowledge. It must not
+    # claim to know what happened between period_start and period_end.
     system_prompt = """
-You are a financial analyst with broad knowledge of market events, corporate news,
-and macroeconomic trends. Write in a professional, analytical tone suitable for
-a university finance course report. Be specific about time periods and events.
-Do NOT fabricate specific earnings figures or stock prices — focus on known
-qualitative themes, sector trends, and company developments.
+You are a financial analyst writing background context for a university finance course report.
+IMPORTANT: Your training knowledge may end BEFORE the analysis period. You must NOT claim to know
+specific events, product launches, earnings results or news that happened during the analysis period.
+Only describe durable facts (business model, sector, structural themes) and typical drivers.
+Never invent dates, figures, or events.
 """
 
     prompt = f"""
-Write a "Market Context & News Factors" section for {ticker} covering the period
-{period_start} to {period_end}.
+Write a "Background Context" section for {ticker}. The price data covers {period_start} to {period_end}.
 
-Key data points to contextualise:
+Key data points:
 - Total return over the period: {total_return}%
 - Best single trading day: {best_date}
 - Worst single trading day: {worst_date}
 - Statistically extreme outlier dates: {outliers if outliers else "None detected"}
 
-Using your knowledge of {ticker} and its industry, write 3 paragraphs with these headers:
+Write 3 short paragraphs with these headers:
 
 **Company & Sector Overview**
-Briefly describe what {ticker} does and which sector/industry it operates in.
-Mention 1-2 major strategic themes or business developments relevant to this period.
+Describe what {ticker} does, its sector/industry, and its main revenue drivers (durable facts only).
 
-**Key Market Themes & Drivers**
-What macro-economic or sector-specific themes (e.g. AI boom, interest rate environment,
-regulatory changes, supply chain shifts) likely influenced {ticker}'s performance
-during this period? Discuss 2-3 themes specifically relevant to this company.
+**Structural Themes to Consider**
+Name 2-3 long-running themes (e.g. interest-rate sensitivity, AI investment cycle, regulation,
+consumer demand) that typically affect {ticker}. Phrase them as factors to check, not as claims about this period.
 
-**News Context for Outlier Dates**
-If outlier dates were detected, discuss what types of corporate events
-(earnings releases, product launches, analyst upgrades/downgrades, macro data releases)
-typically drive extreme single-day moves for {ticker}.
-If no outliers were detected, comment on what that stability suggests about
-market sentiment toward the company during this period.
+**What Typically Drives Large Moves**
+For the best/worst/outlier dates above, list the types of events that usually cause such moves for
+{ticker} (earnings releases, guidance changes, macro data, analyst actions). State clearly that the
+actual cause of each date should be verified against news from that date.
 """
-    return _call_groq(prompt, system_prompt, max_tokens=800)
+    note = ("_Note: background knowledge from the language model, not live news. "
+            "Verify against news sources for the analysis period._\n")
+    return note + _call_groq(prompt, system_prompt, max_tokens=800)
 
 
 def generate_anomaly_commentary(ticker: str, data_context: dict) -> str:
@@ -321,16 +472,32 @@ def generate_risk_commentary(data_context: dict) -> str:
     """Produce a risk comparison across all tracked assets."""
     risk_summary = {
         ticker: {
-            "annual_volatility_proxy": round(data["returns"]["std_daily_pct"] * (252 ** 0.5), 2),
-            "daily_std_pct":           data["returns"]["std_daily_pct"],
-            "recent_30d_volatility":   data["short_term_momentum"]["last_30d_volatility"],
-            "worst_day_pct":           data["returns"]["worst_day_pct"],
-            "worst_day_date":          data["returns"]["worst_day_date"],
-            "sharpe_ratio_approx":     data["returns"]["sharpe_ratio_approx"],
-            "win_rate_pct":            data["returns"]["win_rate_pct"],
-            "total_return_pct":        data["full_year_price"]["total_return_pct"],
+            "annualised_volatility_pct": data["returns"]["annualised_volatility_pct"],
+            "daily_std_pct":             data["returns"]["std_daily_pct"],
+            "recent_30d_volatility":     data["short_term_momentum"]["last_30d_volatility"],
+            "recent_volatility_vs_full_period": data["short_term_momentum"]["recent_volatility_vs_full_period"],
+            "worst_day_pct":             data["returns"]["worst_day_pct"],
+            "worst_day_date":            data["returns"]["worst_day_date"],
+            "sharpe_ratio_annualised":   data["returns"]["sharpe_ratio_annualised"],
+            "sharpe_interpretation":     data["returns"]["sharpe_interpretation"],
+            "win_rate_pct":              data["returns"]["win_rate_pct"],
+            "total_return_pct":          data["price_summary"]["total_return_pct"],
+            "beta_vs_benchmark":         data.get("vs_benchmark", {}).get("beta_vs_benchmark"),
         }
         for ticker, data in data_context.items()
+    }
+
+    # Pre-computed rankings so the LLM doesn't have to sort numbers itself
+    tickers = list(risk_summary)
+    derived = {
+        "volatility_ranking_least_to_most_risky":
+            sorted(tickers, key=lambda t: risk_summary[t]["annualised_volatility_pct"]),
+        "sharpe_ranking_best_to_worst":
+            sorted(tickers, key=lambda t: risk_summary[t]["sharpe_ratio_annualised"], reverse=True),
+        "single_worst_day": min(
+            ({"ticker": t, "pct": risk_summary[t]["worst_day_pct"],
+              "date": risk_summary[t]["worst_day_date"]} for t in tickers),
+            key=lambda d: d["pct"]),
     }
 
     system_prompt = """
@@ -339,21 +506,24 @@ Use only the provided data. Reference specific numbers in every claim.
 Write 2 well-structured paragraphs.
 """
 
+    single = len(tickers) == 1
     prompt = f"""
-Write a risk commentary comparing these assets using the data below:
+Write a risk commentary for {"this asset" if single else "these assets"} using the data below:
 
 {json.dumps(risk_summary, indent=2)}
 
-Paragraph 1 — Volatility Ranking:
-Rank all assets from least to most risky by daily_std_pct.
-Annualise the volatility using annual_volatility_proxy.
-Note which asset had the single worst day and on what date.
-Comment on whether recent 30-day volatility is higher or lower than the full-year average.
+PRE-COMPUTED FACTS (use these exactly):
+{json.dumps(derived, indent=2)}
+
+Paragraph 1 — Volatility:
+{"State the annualised volatility" if single else "Give the volatility_ranking_least_to_most_risky order, with each annualised_volatility_pct"}.
+State the worst day and its date (single_worst_day).
+Say whether recent 30-day volatility is higher or lower than the full period (recent_volatility_vs_full_period).
 
 Paragraph 2 — Risk-Adjusted Performance:
-Use sharpe_ratio_approx and win_rate_pct to assess which asset gave the best return per unit of risk.
-Discuss whether high-return assets justified their volatility.
-Conclude with a practical implication for a risk-averse vs risk-tolerant investor.
+Use sharpe_ratio_annualised with its sharpe_interpretation{"" if single else " and the sharpe_ranking_best_to_worst"}.
+Discuss whether the return justified the volatility. If beta_vs_benchmark is present, explain it.
+Conclude with a practical implication for a risk-averse vs risk-tolerant investor (no buy/sell advice).
 """
     return _call_groq(prompt, system_prompt, max_tokens=600)
 
@@ -370,59 +540,76 @@ def generate_comparative_analysis(data_context: dict) -> str:
         ticker = tickers[0]
         data   = data_context[ticker]
 
+        bench = data.get("vs_benchmark")
+
         system_prompt = """
-You are a senior equity analyst writing a sector comparison for a university finance report.
-Be specific and analytical. Reference the exact numbers provided.
+You are a senior equity analyst writing a market benchmarking section for a university finance report.
+Be specific and analytical. Reference only the exact numbers provided.
+Do NOT state peer or sector returns from memory: only the benchmark data given here is real.
 Write exactly 3 paragraphs with the headers shown.
 """
         prompt = f"""
-Only one asset ({ticker}) was analysed. Instead of a multi-stock comparison,
-write a sector benchmarking analysis using the data below and your knowledge of
-{ticker}'s industry peers and the broader market.
+Only one asset ({ticker}) was analysed. Write a benchmarking analysis against the market benchmark.
 
 Data for {ticker}:
-- Total return: {data['full_year_price']['total_return_pct']}%
-- Daily volatility: {data['returns']['std_daily_pct']}%
-- Sharpe ratio: {data['returns']['sharpe_ratio_approx']}
+- Total return: {data['price_summary']['total_return_pct']}%
+- Annualised volatility: {data['returns']['annualised_volatility_pct']}%
+- Annualised Sharpe ratio: {data['returns']['sharpe_ratio_annualised']} ({data['returns']['sharpe_interpretation']})
 - Win rate: {data['returns']['win_rate_pct']}%
 - 30-day momentum: {data['short_term_momentum']['last_30d_change_pct']}%
 - MA signal: {data['technical_signals']['ma_signal']}
 - BB signal: {data['technical_signals']['bb_signal']}
 
+BENCHMARK COMPARISON (real data, may be empty):
+{json.dumps(bench or {}, indent=2)}
+
 Write using EXACTLY these section headers:
 
-**Sector Benchmarking**
-Compare {ticker}'s total return of {data['full_year_price']['total_return_pct']}% to
-what you know about typical returns for its sector peers over a similar period.
-Is this outperformance, underperformance, or in line with sector expectations?
+**Benchmark Comparison**
+{"State the benchmark return, the stock's return, excess_return_pct, and whether it outperformed (outperformed_benchmark)." if bench else "Benchmark data is unavailable; say so and describe the absolute return only."}
 
-**Risk Profile vs Peers**
-How does {ticker}'s daily volatility of {data['returns']['std_daily_pct']}% and
-Sharpe ratio of {data['returns']['sharpe_ratio_approx']} compare to what you would
-expect from similar large-cap companies in its sector?
+**Risk Profile vs Market**
+{"Compare the stock's Sharpe ratio to benchmark_sharpe_annualised, and explain beta_vs_benchmark and correlation_vs_benchmark." if bench else "Describe the volatility and Sharpe ratio on an absolute basis."}
 
 **Relative Momentum & Outlook**
-Given the 30-day momentum of {data['short_term_momentum']['last_30d_change_pct']}%
-and the current technical signals, how does {ticker}'s near-term outlook compare
-to the broader market or sector trend? Would you consider it a leader or a lagger?
+Given the 30-day momentum and the technical signals, describe the near-term picture.
+State what an investor should monitor next. Do not give a buy/sell recommendation.
 """
         return _call_groq(prompt, system_prompt, max_tokens=700)
 
     # ── Multi-stock: full comparison ──────────────────────────────────────────
     comparison_data = {
         ticker: {
-            "total_return_pct":    data["full_year_price"]["total_return_pct"],
-            "current_price":       data["full_year_price"]["end_price"],
-            "52w_high":            data["full_year_price"]["52w_high"],
-            "pct_below_52w_high":  data["full_year_price"]["pct_below_52w_high"],
-            "daily_volatility":    data["returns"]["std_daily_pct"],
-            "sharpe_ratio":        data["returns"]["sharpe_ratio_approx"],
-            "win_rate_pct":        data["returns"]["win_rate_pct"],
-            "last_30d_change_pct": data["short_term_momentum"]["last_30d_change_pct"],
-            "ma_signal":           data["technical_signals"]["ma_signal"],
-            "bb_signal":           data["technical_signals"]["bb_signal"],
+            "total_return_pct":       data["price_summary"]["total_return_pct"],
+            "current_price":          data["price_summary"]["end_price"],
+            "period_high":            data["price_summary"]["period_high"],
+            "pct_below_period_high":  data["price_summary"]["pct_below_period_high"],
+            "annualised_volatility_pct": data["returns"]["annualised_volatility_pct"],
+            "sharpe_ratio_annualised": data["returns"]["sharpe_ratio_annualised"],
+            "win_rate_pct":           data["returns"]["win_rate_pct"],
+            "last_30d_change_pct":    data["short_term_momentum"]["last_30d_change_pct"],
+            "excess_return_vs_benchmark_pct": data.get("vs_benchmark", {}).get("excess_return_pct"),
+            "ma_signal":              data["technical_signals"]["ma_signal"],
+            "bb_signal":              data["technical_signals"]["bb_signal"],
         }
         for ticker, data in data_context.items()
+    }
+
+    def rank(field, reverse=True):
+        vals = {t: v[field] for t, v in comparison_data.items() if v[field] is not None}
+        return [f"{t} ({vals[t]})" for t in sorted(vals, key=vals.get, reverse=reverse)]
+
+    returns_rank = rank("total_return_pct")
+    derived = {
+        "return_ranking_best_to_worst":     returns_rank,
+        "return_spread_pct_points": round(
+            max(v["total_return_pct"] for v in comparison_data.values())
+            - min(v["total_return_pct"] for v in comparison_data.values()), 2),
+        "furthest_below_period_high":       rank("pct_below_period_high", reverse=False)[0],
+        "volatility_ranking_lowest_first":  rank("annualised_volatility_pct", reverse=False),
+        "sharpe_ranking_best_to_worst":     rank("sharpe_ratio_annualised"),
+        "win_rate_ranking_best_to_worst":   rank("win_rate_pct"),
+        "momentum_30d_ranking_strongest_first": rank("last_30d_change_pct"),
     }
 
     system_prompt = """
@@ -436,22 +623,25 @@ Write a comparative analysis of the following assets:
 
 {json.dumps(comparison_data, indent=2)}
 
+PRE-COMPUTED RANKINGS (use these exactly, do not re-sort):
+{json.dumps(derived, indent=2)}
+
 Use EXACTLY these section headers:
 
 **Return Comparison**
-Rank all assets by total_return_pct from best to worst. State each figure explicitly.
-Note which is furthest from its 52-week high (pct_below_52w_high) and what that implies.
-End with 1 sentence on what the return spread between best and worst tells us.
+Give return_ranking_best_to_worst. Mention excess_return_vs_benchmark_pct where available.
+Name furthest_below_period_high and what that implies.
+End with 1 sentence on what return_spread_pct_points tells us.
 
 **Risk & Consistency Comparison**
-Compare daily_volatility and sharpe_ratio across all assets.
-Discuss win_rate_pct — which stock had the most consistent positive days?
-Identify which asset offered the best risk-adjusted return and state why.
+Use volatility_ranking_lowest_first and sharpe_ranking_best_to_worst (Sharpe is annualised).
+Use win_rate_ranking_best_to_worst for consistency.
+The best risk-adjusted return is the first entry of sharpe_ranking_best_to_worst; explain why.
 
 **Momentum & Technical Outlook**
-Compare last_30d_change_pct — which asset has the strongest recent momentum?
+Use momentum_30d_ranking_strongest_first.
 Summarise the ma_signal and bb_signal for each asset in one sentence each.
-Conclude with a clear statement: which asset looks most technically constructive right now and why?
+Conclude which asset looks most technically constructive right now, framed as an observation, not a recommendation.
 """
     return _call_groq(prompt, system_prompt, max_tokens=900)
 
@@ -567,7 +757,8 @@ if __name__ == "__main__":
 #  Fundamental & News-Enriched Analysis (Alpha Vantage)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_fundamental_analysis(ticker: str, overview: dict, income: dict, balance: dict) -> str:
+def generate_fundamental_analysis(ticker: str, overview: dict, income: dict, balance: dict,
+                                  current_price: float = None) -> str:
     """
     Generate a financial health analysis using real fundamental data
     from Alpha Vantage: P/E, ROE, ROA, D/E, revenue trends, etc.
@@ -584,6 +775,25 @@ Write in clear, professional English. Each section should be 2-3 sentences.
     income_summary = income.get("quarterly_income", [])[:2] if income else []
     balance_summary = balance.get("quarterly_balance", [])[:1] if balance else []
 
+    # Pre-compute percentages and directions instead of asking the LLM to do arithmetic.
+    def pct(v):
+        return round(v * 100, 2) if v is not None else None
+    facts = {
+        "roe_pct": pct(overview.get("roe")),
+        "roa_pct": pct(overview.get("roa")),
+        "profit_margin_pct": pct(overview.get("profit_margin")),
+        "operating_margin_pct": pct(overview.get("operating_margin")),
+        "current_price": current_price,
+    }
+    target = overview.get("analyst_target_price")
+    if target and current_price:
+        up = round((target / current_price - 1) * 100, 2)
+        facts["analyst_target_implies"] = (f"{up}% upside" if up > 0 else f"{abs(up)}% downside")
+    if len(income_summary) >= 2:
+        q0, q1 = income_summary[0], income_summary[1]
+        facts["revenue_latest_vs_prior_quarter"] = _direction(q0.get("total_revenue"), q1.get("total_revenue"))
+        facts["net_income_latest_vs_prior_quarter"] = _direction(q0.get("net_income"), q1.get("net_income"))
+
     prompt = f"""
 Write a fundamental analysis for {ticker} using the data below.
 
@@ -596,6 +806,9 @@ RECENT INCOME STATEMENT (last 2 quarters):
 LATEST BALANCE SHEET:
 {json.dumps(balance_summary, indent=2)}
 
+PRE-COMPUTED FACTS (use these exactly):
+{json.dumps(facts, indent=2)}
+
 Use EXACTLY these section headers:
 
 **Company Profile**
@@ -607,19 +820,19 @@ Discuss the P/E ratio — is the stock cheap or expensive relative to typical ma
 Comment on P/B ratio and PEG ratio if available. What do these suggest about market expectations?
 
 **Profitability**
-Discuss ROE and ROA — convert to percentages by multiplying by 100.
-Comment on profit margin and operating margin. Is the company efficiently generating profit?
+State roe_pct, roa_pct, profit_margin_pct and operating_margin_pct from PRE-COMPUTED FACTS.
+Is the company efficiently generating profit?
 
 **Financial Health**
-Discuss the debt-to-equity ratio — is the company conservatively or aggressively financed?
-Comment on current ratio and cash position from the balance sheet if available.
+Using the latest balance sheet, compare cash with long_term_debt and short_term_debt.
+If debt_to_equity or current_ratio are null, say they are not provided by this source.
 
 **Revenue & Earnings Trend**
-Using the quarterly income data, is revenue growing or declining quarter over quarter?
-Comment on net income trend and what it implies about business momentum.
+Use revenue_latest_vs_prior_quarter and net_income_latest_vs_prior_quarter exactly as given.
+Note that sequential quarters can be affected by seasonality.
 
 **Analyst Consensus**
-State the analyst target price vs current price — is there upside or downside implied?
+State the analyst target price and analyst_target_implies (if available).
 Summarise the analyst rating breakdown (strong buy / buy / hold / sell counts).
 """
     return _call_groq(prompt, system_prompt, max_tokens=1000)
@@ -692,8 +905,13 @@ def generate_commodity_context(commodity_data: dict,
         tickers:        Optional list of stock tickers being analysed
         sector_info:    Optional dict of {ticker: sector} for specific implications
     """
+    # Only keep commodities that actually returned a price. If none did,
+    # don't ask the LLM to write paragraphs about missing data.
+    commodity_data = {k: v for k, v in (commodity_data or {}).items()
+                      if isinstance(v, dict) and v.get("latest_price") is not None}
     if not commodity_data:
-        return "⚠️  No commodity data available."
+        return ("⚠️  No commodity price data could be retrieved (Yahoo Finance returned nothing). "
+                "Check your connection/VPN and try again.")
 
     system_prompt = """
 You are a macro analyst writing a commodity market context section for a finance report.
@@ -890,8 +1108,9 @@ def fetch_sector_etf_data() -> dict:
                 continue
 
             # Calculate performance metrics
-            ret_1w  = round((close.iloc[-1] / close.iloc[-5]  - 1) * 100, 2) if len(close) >= 5  else None
-            ret_1m  = round((close.iloc[-1] / close.iloc[-21] - 1) * 100, 2) if len(close) >= 21 else None
+            # 1 week = 5 trading days back, 1 month = 21 trading days back
+            ret_1w  = _pct_over(close, 5)
+            ret_1m  = _pct_over(close, 21)
             ret_3m  = round((close.iloc[-1] / close.iloc[0]   - 1) * 100, 2)
             vol_30d = round(float(close.pct_change().tail(21).std() * 100), 3)
 
@@ -955,15 +1174,21 @@ Be specific, analytical, and actionable. Write for a finance-literate audience.
         for sector, data in sorted_sectors
     }
 
+    def _commodity_line(name, d):
+        # Format safely: any field may be missing when a download fails
+        price, chg = d.get("latest_price"), d.get("1m_change_pct")
+        if price is None:
+            return f"- {name}: not available"
+        chg_txt = f"{chg:+.1f}% 1M" if isinstance(chg, (int, float)) else "1M change n/a"
+        return f"- {name}: ${price} ({d.get('trend', 'N/A')}, {chg_txt})"
+
     commodity_context = ""
     if commodity_data:
-        oil   = commodity_data.get("WTI_Oil", {})
-        gold  = commodity_data.get("Gold", {})
-        commodity_context = f"""
-COMMODITY CONTEXT (for macro backdrop):
-- WTI Oil: ${oil.get('latest_price', 'N/A')} ({oil.get('trend', 'N/A')}, {oil.get('1m_change_pct', 'N/A'):+.1f}% 1M)
-- Gold: ${gold.get('latest_price', 'N/A')} ({gold.get('trend', 'N/A')}, {gold.get('1m_change_pct', 'N/A'):+.1f}% 1M)
-"""
+        commodity_context = (
+            "\nCOMMODITY CONTEXT (for macro backdrop):\n"
+            + _commodity_line("WTI Oil", commodity_data.get("WTI_Oil") or {}) + "\n"
+            + _commodity_line("Gold", commodity_data.get("Gold") or {}) + "\n"
+        )
 
     prompt = f"""
 Write a sector rotation and trending analysis using the real ETF data below.
@@ -1084,55 +1309,107 @@ Reference at least 3 specific metrics from the data.
     return _call_groq(prompt, system_prompt, max_tokens=1500)
 
 
-def generate_rss_news_analysis(ticker: str, articles: list) -> str:
-    """
-    Generate a news sentiment analysis from RSS feed articles.
-    No Alpha Vantage quota used — completely free via Yahoo Finance RSS.
-
-    Args:
-        ticker:   Stock symbol
-        articles: List of article dicts from fetch_rss_news()
-    """
-    if not articles:
-        return f"⚠️  No RSS news articles found for {ticker}."
-
-    # Build headline list for the prompt
-    headlines = "\n".join([
-        f"  [{a['published'][:10]}] {a['title']} — {a['summary'][:100]}"
-        for a in articles[:8]
-    ])
-
-    system_prompt = """
-You are a financial news analyst writing a news review for a university finance course.
-Reference specific headlines and dates from the provided list.
-Do NOT fabricate any news — only reference what is given. Write professionally.
-"""
-
-    prompt = f"""
-Analyse the following recent news headlines for {ticker} from Yahoo Finance RSS:
-
-{headlines}
-
-Write using EXACTLY these section headers:
-
-**📰 News Overview**
-How many articles were found and what is the general tone — mostly positive, negative, or mixed?
-What are the 2-3 dominant themes across these headlines?
-
-**🔍 Key Stories**
-Highlight the 2-3 most significant headlines. Reference the exact title and date.
-What do these stories suggest about the company's current situation?
-
-**📊 Sentiment & Market Implication**
-Based on the headlines, is current news sentiment likely to be a tailwind or headwind for the stock?
-What should investors watch for in upcoming news coverage?
-"""
-    return _call_groq(prompt, system_prompt, max_tokens=600)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  yfinance Financial Statement Analysis (Free, No Quota)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _direction(new, old, flat_tolerance_pct: float = 0.5) -> str:
+    """'increased' / 'decreased' / 'roughly flat' between two values (None-safe)."""
+    if new is None or old is None or old == 0:
+        return "n/a"
+    change = (new - old) / abs(old) * 100
+    if abs(change) < flat_tolerance_pct:
+        return "roughly flat"
+    return "increased" if change > 0 else "decreased"
+
+
+def _chg_pct(new, old):
+    if new is None or old is None or old == 0:
+        return None
+    return round((new - old) / abs(old) * 100, 2)
+
+
+def _fmt_big(v):
+    """Format a raw USD amount as $X.XXB / $X.XM."""
+    if v is None:
+        return "N/A"
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1e9:
+        return f"{sign}${v / 1e9:.2f}B"
+    if v >= 1e6:
+        return f"{sign}${v / 1e6:.1f}M"
+    return f"{sign}${v:,.0f}"
+
+
+def _series_facts(rows: list, field: str, label: str) -> dict:
+    """
+    Year-by-year changes for one field. `rows` are most-recent-first.
+    Returns the chronological changes plus whether growth is accelerating.
+    """
+    chron = [r for r in reversed(rows) if r.get(field) is not None]
+    steps = []
+    for prev, curr in zip(chron, chron[1:]):
+        steps.append({
+            "from_period": prev["period"][:10], "to_period": curr["period"][:10],
+            "from": _fmt_big(prev[field]) if abs(prev[field]) > 1e5 else prev[field],
+            "to":   _fmt_big(curr[field]) if abs(curr[field]) > 1e5 else curr[field],
+            "change_pct": _chg_pct(curr[field], prev[field]),
+            "direction":  _direction(curr[field], prev[field]),
+        })
+    facts = {f"{label}_changes": steps}
+    if len(steps) >= 2 and steps[-1]["change_pct"] is not None and steps[-2]["change_pct"] is not None:
+        last, prev = steps[-1]["change_pct"], steps[-2]["change_pct"]
+        if last >= 0 and prev >= 0:
+            trend = "growth accelerating" if last > prev else "growth decelerating"
+        elif last < 0 and prev < 0:
+            trend = "declining faster" if last < prev else "declining more slowly"
+        else:
+            trend = "reversed to growth" if last >= 0 else "reversed to decline"
+        facts[f"{label}_latest_trend"] = trend
+    return facts
+
+
+def _income_facts(annual: list, quarterly: list) -> dict:
+    facts = {}
+    facts.update(_series_facts(annual, "total_revenue", "annual_revenue"))
+    facts.update(_series_facts(annual, "net_income", "annual_net_income"))
+    if len(annual) >= 2:
+        c, p = annual[0], annual[1]
+        for m in ("gross_margin_pct", "operating_margin_pct", "net_margin_pct"):
+            if c.get(m) is not None and p.get(m) is not None:
+                diff = round(c[m] - p[m], 2)
+                facts[f"{m}_latest_vs_prior_year"] = {
+                    "latest": c[m], "prior": p[m], "change_pct_points": diff,
+                    "direction": "expanded" if diff > 0.1 else ("compressed" if diff < -0.1 else "stable"),
+                }
+    if len(quarterly) >= 2:
+        q0, q1 = quarterly[0], quarterly[1]
+        facts["latest_quarter_vs_prior_quarter"] = {
+            "latest_quarter": q0["period"], "prior_quarter": q1["period"],
+            "revenue_latest": _fmt_big(q0.get("total_revenue")),
+            "revenue_prior":  _fmt_big(q1.get("total_revenue")),
+            "revenue_change_pct": _chg_pct(q0.get("total_revenue"), q1.get("total_revenue")),
+            "revenue_direction":  _direction(q0.get("total_revenue"), q1.get("total_revenue")),
+            "net_income_latest": _fmt_big(q0.get("net_income")),
+            "net_income_prior":  _fmt_big(q1.get("net_income")),
+            "net_income_direction": _direction(q0.get("net_income"), q1.get("net_income")),
+            "note": "Sequential quarters can differ because of seasonality; the YoY comparison is more reliable.",
+        }
+    if len(quarterly) >= 5:
+        q0, q4 = quarterly[0], quarterly[4]
+        facts["latest_quarter_vs_same_quarter_last_year"] = {
+            "latest_quarter": q0["period"], "year_ago_quarter": q4["period"],
+            "revenue_change_pct": _chg_pct(q0.get("total_revenue"), q4.get("total_revenue")),
+            "revenue_direction":  _direction(q0.get("total_revenue"), q4.get("total_revenue")),
+            "net_income_change_pct": _chg_pct(q0.get("net_income"), q4.get("net_income")),
+            "net_income_direction":  _direction(q0.get("net_income"), q4.get("net_income")),
+        }
+    if quarterly and quarterly[0].get("net_margin_pct") is not None and quarterly[0]["net_margin_pct"] > 40:
+        facts["warning"] = ("Latest quarter net margin above 40%: this may include one-off items "
+                            "(e.g. investment gains or tax effects). Mention this possibility.")
+    return facts
+
 
 def generate_yfinance_income_analysis(ticker: str, income: dict) -> str:
     """Analyse income statement data fetched from yfinance."""
@@ -1142,6 +1419,8 @@ def generate_yfinance_income_analysis(ticker: str, income: dict) -> str:
 
     if not annual:
         return f"⚠️  No income statement data available for {ticker}."
+
+    facts = _income_facts(annual, quarterly)
 
     system_prompt = """
 You are a financial analyst writing an income statement review for a university finance course.
@@ -1154,35 +1433,69 @@ Analyse the income statement for {ticker} using the data below.
 ANNUAL DATA (most recent first):
 {json.dumps(annual[:4], indent=2, default=str)}
 
-QUARTERLY DATA (most recent 4 quarters):
-{json.dumps(quarterly[:4], indent=2, default=str)}
+QUARTERLY DATA (most recent first):
+{json.dumps(quarterly[:5], indent=2, default=str)}
 
 YEAR-OVER-YEAR GROWTH:
 {json.dumps(yoy, indent=2)}
 
+PRE-COMPUTED FACTS (directions and changes are already correct; use them as-is):
+{json.dumps(facts, indent=2, default=str)}
+
 Write using EXACTLY these section headers:
 
 **Revenue Trend**
-State annual revenue for each year using revenue_fmt values.
-Calculate and state the year-over-year revenue growth from yoy_growth.
-Is revenue accelerating or decelerating?
+State annual revenue for each year (revenue_fmt) and each change from annual_revenue_changes.
+State annual_revenue_latest_trend if present.
 
 **Profitability Analysis**
-Compare gross_margin_pct, operating_margin_pct, and net_margin_pct across years.
-Are margins expanding or compressing? What does this mean for the business?
+Use the *_margin_pct_latest_vs_prior_year facts: state each margin and whether it expanded, compressed or was stable.
+Explain what this means for the business.
 
 **Quarterly Momentum**
-Using the quarterly data, what is the most recent quarter's revenue and net income?
-How does it compare to the prior quarter? Is there short-term acceleration?
+Use latest_quarter_vs_same_quarter_last_year as the main comparison (if present), then
+latest_quarter_vs_prior_quarter. Use the direction words exactly as given.
+If a warning is present, mention it.
 
 **R&D Investment**
-If rd_expense data is available, comment on R&D spending as a % of revenue.
-What does this suggest about the company's investment in future growth?
+If rd_pct_of_revenue is available, state it and what it suggests about investment in future growth.
+If not available, say so in one sentence.
 
 **Key Takeaway**
 2-3 sentences summarising the income statement story. Reference at least 3 specific numbers.
 """
     return _call_groq(prompt, system_prompt, max_tokens=1000)
+
+
+def _balance_facts(annual: list) -> dict:
+    facts = {}
+    facts.update(_series_facts(annual, "total_assets", "total_assets"))
+    facts.update(_series_facts(annual, "total_debt", "total_debt"))
+    facts.update(_series_facts(annual, "shareholder_equity", "equity"))
+    if annual:
+        r = annual[0]
+        if r.get("cash") is not None and r.get("total_debt") is not None:
+            facts["latest_cash_vs_total_debt"] = {
+                "cash": _fmt_big(r["cash"]), "total_debt": _fmt_big(r["total_debt"]),
+                "net_cash": _fmt_big(r["net_cash"]),
+                "position": "net cash (cash exceeds debt)" if r["net_cash"] >= 0
+                            else "net debt (debt exceeds cash)",
+                "cash_covers_debt_pct": round(r["cash"] / r["total_debt"] * 100, 1)
+                                        if r["total_debt"] else None,
+            }
+        de = r.get("debt_to_equity_x")
+        if de is not None:
+            facts["leverage_assessment"] = (
+                "low (below 0.5x)" if de < 0.5 else
+                "moderate (0.5x-1.5x)" if de < 1.5 else
+                "high (above 1.5x); check whether buybacks have shrunk equity")
+        elif r.get("shareholder_equity") is not None and r["shareholder_equity"] <= 0:
+            facts["leverage_assessment"] = "debt-to-equity not meaningful: shareholder equity is zero or negative"
+        if r.get("retained_earnings") is not None and r["retained_earnings"] < 0:
+            facts["retained_earnings_note"] = (
+                "Retained earnings are negative. For mature companies this is often caused by "
+                "large share buybacks and dividends exceeding cumulative profits, not by losses. Check the cash flow statement.")
+    return facts
 
 
 def generate_yfinance_balance_analysis(ticker: str, balance: dict) -> str:
@@ -1191,6 +1504,8 @@ def generate_yfinance_balance_analysis(ticker: str, balance: dict) -> str:
 
     if not annual:
         return f"⚠️  No balance sheet data available for {ticker}."
+
+    facts = _balance_facts(annual)
 
     system_prompt = """
 You are a financial analyst writing a balance sheet review for a university finance course.
@@ -1203,28 +1518,56 @@ Analyse the balance sheet for {ticker} using the data below.
 ANNUAL BALANCE SHEET DATA (most recent first):
 {json.dumps(annual[:4], indent=2, default=str)}
 
+PRE-COMPUTED FACTS (directions and assessments are already correct; use them as-is):
+{json.dumps(facts, indent=2, default=str)}
+
 Write using EXACTLY these section headers:
 
 **Asset Base & Growth**
-State total_assets for each year using assets_fmt. Is the asset base growing?
-What does this say about business expansion and capital investment?
+State total assets per year (assets_fmt) and the changes from total_assets_changes.
 
 **Debt & Leverage**
-State long_term_debt and de_ratio_pct for the most recent year.
-Is debt increasing or decreasing? Is the leverage level sustainable?
+State total_debt_fmt and debt_to_equity_x (a multiple, e.g. 1.34x) for the most recent year.
+Use total_debt_changes for the direction and leverage_assessment for the verdict.
 
 **Equity & Retained Earnings**
-State shareholder_equity using equity_fmt and compare across years.
-Is equity growing (good) or shrinking (concern)? Reference retained_earnings if available.
+State shareholder equity per year (equity_fmt) using equity_changes.
+If retained_earnings_note is present, explain it.
 
 **Cash Position & Liquidity**
-State cash using cash_fmt. How does cash compare to long_term_debt?
-Can the company comfortably service its debt from its cash position?
+Use latest_cash_vs_total_debt (net cash vs net debt) and current_ratio_x (above 1.0 = current assets cover current liabilities).
 
 **Key Takeaway**
 2-3 sentences on financial strength and stability. Reference at least 3 specific numbers.
 """
     return _call_groq(prompt, system_prompt, max_tokens=900)
+
+
+def _cashflow_facts(annual: list) -> dict:
+    facts = {}
+    facts.update(_series_facts(annual, "operating_cf", "operating_cf"))
+    facts.update(_series_facts(annual, "free_cash_flow", "fcf"))
+    facts.update(_series_facts(annual, "capex", "capex"))
+    if annual:
+        r = annual[0]
+        if r.get("capex_pct_of_operating_cf") is not None:
+            facts["latest_capex_pct_of_operating_cf"] = r["capex_pct_of_operating_cf"]
+        returned = sum(abs(v) for v in (r.get("share_buybacks"), r.get("dividends_paid")) if v)
+        if returned and r.get("free_cash_flow"):
+            facts["shareholder_returns_latest_year"] = {
+                "buybacks": _fmt_big(abs(r["share_buybacks"])) if r.get("share_buybacks") else "N/A",
+                "dividends": _fmt_big(abs(r["dividends_paid"])) if r.get("dividends_paid") else "N/A",
+                "total_returned": _fmt_big(returned),
+                "pct_of_fcf": round(returned / r["free_cash_flow"] * 100, 1) if r["free_cash_flow"] > 0 else None,
+            }
+        if r.get("financing_cf") is not None:
+            facts["financing_cf_meaning"] = (
+                "negative: net cash returned to shareholders/lenders (buybacks, dividends, debt repayment)"
+                if r["financing_cf"] < 0 else
+                "positive: net cash raised (new debt or equity issuance)")
+        if r.get("free_cash_flow") is not None:
+            facts["is_cash_generative"] = r["free_cash_flow"] > 0
+    return facts
 
 
 def generate_yfinance_cashflow_analysis(ticker: str, cashflow: dict) -> str:
@@ -1234,6 +1577,8 @@ def generate_yfinance_cashflow_analysis(ticker: str, cashflow: dict) -> str:
 
     if not annual:
         return f"⚠️  No cash flow data available for {ticker}."
+
+    facts = _cashflow_facts(annual)
 
     system_prompt = """
 You are a financial analyst writing a cash flow review for a university finance course.
@@ -1248,30 +1593,80 @@ ANNUAL CASH FLOW DATA (most recent first):
 
 FCF YEAR-OVER-YEAR GROWTH: {fcf_growth}%
 
+PRE-COMPUTED FACTS (directions are already correct; use them as-is):
+{json.dumps(facts, indent=2, default=str)}
+
 Write using EXACTLY these section headers:
 
 **Operating Cash Flow**
-State operating_cf using operating_cf_fmt for each year. Is the company generating
-more or less cash from operations? What does the trend suggest?
+State operating cash flow per year (operating_cf_fmt) and the changes from operating_cf_changes.
 
 **Free Cash Flow (FCF)**
-State free_cash_flow using fcf_fmt for each year.
-FCF growth is {fcf_growth}% year-over-year — is this strong or concerning?
-FCF is the truest measure of a company's cash-generating ability — explain why.
+State FCF per year (fcf_fmt) and fcf_changes. Explain briefly why FCF (cash left after capex)
+matters more than accounting profit. Use is_cash_generative.
 
 **Capital Expenditure**
-State capex using capex_fmt. Is the company investing heavily in infrastructure?
-Is capex rising or falling relative to operating cash flow?
+State capex per year (capex_fmt, shown negative because it is cash spent) and
+latest_capex_pct_of_operating_cf. Is the company investing more heavily relative to its cash generation?
 
 **Financing Activities**
-Comment on financing_cf — is the company raising debt, repurchasing shares, or paying dividends?
-What does this say about management's capital allocation priorities?
+Use financing_cf_meaning and shareholder_returns_latest_year (buybacks, dividends, % of FCF).
+What does this say about capital allocation priorities?
 
 **Key Takeaway**
 2-3 sentences on cash flow quality and sustainability. Reference at least 3 specific numbers.
-FCF is king — make sure to highlight whether this company is truly cash-generative.
 """
     return _call_groq(prompt, system_prompt, max_tokens=900)
+
+
+def _metrics_facts(metrics: dict) -> dict:
+    val  = metrics.get("valuation", {}) or {}
+    earn = metrics.get("earnings", {}) or {}
+    grow = metrics.get("growth", {}) or {}
+    prof = metrics.get("profitability", {}) or {}
+    fin  = metrics.get("financial_health", {}) or {}
+    ana  = metrics.get("analyst", {}) or {}
+    facts = {}
+
+    pe = val.get("pe_trailing")
+    if pe is not None:
+        facts["pe_vs_sp500_typical_20_to_25x"] = (
+            "below typical market range" if pe < 20 else
+            "within typical market range" if pe <= 25 else "above typical market range")
+    pf = val.get("pe_forward")
+    if pe is not None and pf is not None:
+        facts["forward_vs_trailing_pe"] = (
+            "forward P/E is lower: analysts expect earnings to grow" if pf < pe else
+            "forward P/E is higher: analysts expect earnings to decline")
+    eg, rg = earn.get("eps_growth_pct"), grow.get("revenue_yoy_pct")
+    if eg is not None and rg is not None:
+        facts["expected_eps_growth_vs_recent_revenue_growth"] = (
+            f"expected EPS growth ({eg}%) is HIGHER than recent revenue growth ({rg}%)" if eg > rg else
+            f"expected EPS growth ({eg}%) is LOWER than recent revenue growth ({rg}%)" if eg < rg else
+            f"expected EPS growth equals recent revenue growth ({eg}%)")
+    fy = prof.get("fcf_yield_pct")
+    if fy is not None:
+        facts["fcf_yield_vs_3pct"] = "above 3% (strong)" if fy > 3 else "below 3% (modest relative to market value)"
+    de = fin.get("debt_to_equity_x")
+    if de is not None:
+        facts["leverage_assessment"] = (
+            "low (below 0.5x)" if de < 0.5 else "moderate (0.5x-1.5x)" if de < 1.5 else "high (above 1.5x)")
+    cr = fin.get("current_ratio_x")
+    if cr is not None:
+        facts["liquidity_assessment"] = (
+            "current ratio below 1.0x: current liabilities exceed current assets" if cr < 1 else
+            "current ratio at/above 1.0x: current assets cover current liabilities")
+    beta = val.get("beta")
+    if beta is not None:
+        facts["beta_interpretation"] = (
+            "lower volatility than the market (beta < 0.8)" if beta < 0.8 else
+            "roughly market-like volatility (beta 0.8-1.2)" if beta <= 1.2 else
+            "higher volatility than the market (beta > 1.2)")
+    up = ana.get("upside_pct")
+    if up is not None:
+        facts["analyst_target_implies"] = (
+            f"{up}% upside to the mean target" if up > 0 else f"{abs(up)}% downside to the mean target")
+    return facts
 
 
 def generate_key_metrics_dashboard(ticker: str, metrics: dict) -> str:
@@ -1282,11 +1677,11 @@ def generate_key_metrics_dashboard(ticker: str, metrics: dict) -> str:
     if not metrics:
         return f"⚠️  No key metrics data available for {ticker}."
 
+    facts = _metrics_facts(metrics)
+
     system_prompt = """
 You are an equity analyst writing a metrics dashboard summary for a university finance report.
 Use ONLY the exact numbers provided. Be specific and analytical.
-Compare each metric to typical market benchmarks where relevant (S&P 500 avg P/E ~20-25x,
-good FCF yield >3%, healthy gross margin varies by sector).
 """
     prompt = f"""
 Write a key metrics dashboard for {ticker} using the data below.
@@ -1294,28 +1689,31 @@ Write a key metrics dashboard for {ticker} using the data below.
 METRICS DATA:
 {json.dumps(metrics, indent=2, default=str)}
 
+PRE-COMPUTED ASSESSMENTS (already correct; use them as-is and do not contradict them):
+{json.dumps(facts, indent=2)}
+
 Write using EXACTLY these section headers:
 
 **Valuation Snapshot**
-State current P/E (trailing and forward), P/B, P/S, and PEG ratio.
-Is the stock cheap or expensive vs typical market averages?
-What does the difference between trailing and forward P/E suggest about earnings expectations?
+State P/E (trailing and forward), P/B, P/S, and PEG ratio.
+Use pe_vs_sp500_typical_20_to_25x and forward_vs_trailing_pe. Note that a high P/B can reflect
+buybacks shrinking book equity rather than overvaluation.
 
 **Growth Profile**
-State EPS TTM, forward EPS, and EPS growth %.
-State revenue YoY growth %. Is this company growing faster or slower than expected?
+State EPS TTM and forward EPS. Describe eps_growth_pct as analyst-EXPECTED growth (see eps_growth_basis).
+State revenue_yoy_pct (see revenue_growth_basis). Use expected_eps_growth_vs_recent_revenue_growth exactly.
 
 **Profitability & Cash Generation**
-State gross margin, operating margin, and net margin as percentages.
-State FCF yield % — is the company generating strong free cash flow relative to its market cap?
+State gross, operating and net margin %, ROE % and ROA %.
+State FCF yield % with fcf_yield_vs_3pct. State dividend_yield_pct if available.
 
 **Financial Health**
-State current ratio and debt-to-equity. Is the balance sheet strong or stretched?
-State beta — is this a high or low volatility stock vs the market?
+State current_ratio_x and debt_to_equity_x (multiples, e.g. 0.84x) with liquidity_assessment and leverage_assessment.
+State beta (Yahoo 5-year monthly beta) with beta_interpretation.
 
 **Analyst Consensus**
-State the analyst recommendation, target price, and upside % from current price.
-How many analysts cover this stock? Does the market agree or disagree with analysts?
+State the recommendation, target price and analyst_target_implies, plus the number of analysts.
+Note that analyst targets are opinions, not forecasts of what will happen.
 """
     return _call_groq(prompt, system_prompt, max_tokens=900)
 
@@ -1359,7 +1757,7 @@ Write in 3 structured paragraphs with the headers shown.
     prompt = f"""
 Analyse the following news articles for {ticker}:
 
-SENTIMENT SUMMARY: {pos} Positive | {neg} Negative | {neu} Neutral articles
+SENTIMENT SUMMARY (simple headline keyword tags, not a model score): {pos} Positive | {neg} Negative | {neu} Neutral or Mixed
 
 HEADLINES:
 {headlines}
@@ -1367,7 +1765,7 @@ HEADLINES:
 Write using EXACTLY these section headers:
 
 **News Overview**
-Summarise the overall news sentiment ({pos} positive, {neg} negative, {neu} neutral).
+Summarise the overall news tone ({pos} positive, {neg} negative, {neu} neutral/mixed). Note these tags come from simple keyword matching.
 What is the dominant narrative around {ticker} in recent coverage?
 
 **Key Themes**

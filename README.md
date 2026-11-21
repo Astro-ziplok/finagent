@@ -33,7 +33,7 @@ finagent/
 │   ├── charts/                      ← Charts organised by ticker
 │   ├── analysis/                    ← AI analysis text reports + exported PDFs
 │   └── data_snapshots/              ← Summary statistics CSVs
-├── tests/                           ← 44 unit tests (pytest)
+├── tests/                           ← unit tests (pytest)
 ├── agent.py                         ← PRIMARY entry point - interactive agent
 ├── main.py                          ← Alternative - fixed batch pipeline
 ├── config.py                        ← Global settings (tickers, paths, keys)
@@ -190,8 +190,8 @@ You: quit
 | Compare | "Compare AAPL and MSFT" | 0 |
 | Trend | "Show me the trend for TSLA" | 0 |
 | Risk | "What is the risk of GOOGL?" | 0 |
-| Full report | "Full report on Nvidia" | up to 4 per ticker |
-| Fundamentals | "Fundamentals for AAPL" | 0 (yfinance) |
+| Full report | "Full report on Nvidia" | up to 2 per ticker |
+| Fundamentals | "Fundamentals for AAPL" | up to 1 per ticker (overview), rest via yfinance |
 | Income statement | "Income statement Amazon 2024 vs 2025" | 0 (yfinance) |
 | Balance sheet | "Balance sheet MSFT" | 0 (yfinance) |
 | Cash flow | "Cash flow Amazon" | 0 (yfinance) |
@@ -245,7 +245,8 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-44 tests covering cleaning, collection, visualization and analysis modules.
+Tests cover cleaning, collection, visualization and analysis modules, including the financial
+metric calculations (Sharpe ratio, calendar quarters, benchmark stats, unit conversions).
 All tests use synthetic data - no real API calls are made during testing.
 
 ---
@@ -256,9 +257,34 @@ All tests use synthetic data - no real API calls are made during testing.
 |---------|-----|
 | `ModuleNotFoundError` | Activate venv first: `venv\Scripts\activate`, then `pip install -r requirements.txt` |
 | Stocks not loading | Turn on a VPN - Yahoo Finance blocks some regions including Vietnam |
-| Alpha Vantage returns empty | 25 requests/day limit hit. Type `quota` to check. Resets at 7 AM |
+| Alpha Vantage returns empty | 25 requests/day limit hit. Type `quota` to check. The local counter resets on the next calendar day |
 | `GROQ_API_KEY not set` | Check `.env` file exists and has no spaces around the `=` sign |
 | Groq API 403 error | Network issue - turn on VPN and try again |
 | Yellow warnings in VS Code | `Ctrl+Shift+P` → `Python: Select Interpreter` → select the venv option |
 | `cd finagent` fails | Run `dir` to check your current folder location |
 | PDF export fails | Microsoft Word must be installed. Falls back to .docx if Word is missing |
+
+---
+
+## Methodology Notes
+
+How the key numbers are calculated, so results can be checked:
+
+| Metric | Definition |
+|---|---|
+| Sharpe ratio | Annualised: `(mean daily return - daily risk-free rate) / daily std * sqrt(252)`. Risk-free rate is `RISK_FREE_RATE` in `config.py` (default 4%). Rough guide: <0.5 weak, 0.5-1 moderate, 1-2 good, >2 very strong |
+| Volatility | Annualised: daily standard deviation of returns * sqrt(252) |
+| Benchmark | Every stock is compared with `BENCHMARK_TICKER` (default SPY) over the same dates: excess return, beta and correlation |
+| Quarterly breakdown | Calendar quarters (e.g. 2025-Q3); each quarter's return is measured from the previous quarter's close. Partial quarters are flagged |
+| Period high/low | Called "52-week" only when the data covers about one year; otherwise labelled with the actual date range |
+| Debt-to-equity | Total debt / shareholders' equity, shown as a multiple (e.g. 1.34x). Not shown when equity is negative |
+| EPS growth | Forward EPS vs trailing EPS, i.e. growth analysts *expect*, not historical growth |
+| Revenue growth | Most recent quarter vs the same quarter one year earlier (Yahoo `revenueGrowth`) |
+| Dividend yield | Annual dividend rate / current price |
+| News tone (RSS) | Simple whole-word keyword tags on headlines; directional only, not a sentiment model |
+
+Comparisons, rankings and "increased/decreased" wording are computed in Python and handed to the
+LLM as facts, so the written analysis cannot get the direction of a change wrong. The
+"Background Context" section is the language model's general knowledge, not live news.
+
+**Disclaimer:** FinAgent is an educational project. Its output is not investment advice.

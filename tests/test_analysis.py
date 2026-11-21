@@ -55,14 +55,14 @@ class TestBuildDataContext(unittest.TestCase):
         self.assertIn("MSFT", self.context)
 
     def test_context_has_required_keys(self):
-        for key in ["period", "full_year_price", "returns",
+        for key in ["period", "price_summary", "returns",
                     "short_term_momentum", "technical_signals",
                     "quarterly_breakdown", "outlier_dates"]:
             self.assertIn(key, self.context["AAPL"],
                           f"Context missing key: {key}")
 
     def test_total_return_is_float(self):
-        ret = self.context["AAPL"]["full_year_price"]["total_return_pct"]
+        ret = self.context["AAPL"]["price_summary"]["total_return_pct"]
         self.assertIsInstance(ret, float)
 
     def test_win_rate_between_0_and_100(self):
@@ -89,12 +89,12 @@ class TestBuildDataContext(unittest.TestCase):
         self.assertIsInstance(od, list)
 
     def test_sharpe_ratio_is_numeric(self):
-        sharpe = self.context["AAPL"]["returns"]["sharpe_ratio_approx"]
+        sharpe = self.context["AAPL"]["returns"]["sharpe_ratio_annualised"]
         self.assertIsInstance(sharpe, (int, float))
 
-    def test_52w_high_gte_52w_low(self):
-        prices = self.context["AAPL"]["full_year_price"]
-        self.assertGreaterEqual(prices["52w_high"], prices["52w_low"])
+    def test_period_high_gte_period_low(self):
+        prices = self.context["AAPL"]["price_summary"]
+        self.assertGreaterEqual(prices["period_high"], prices["period_low"])
 
 
 class TestAnalysisFunctionsWithMockedLLM(unittest.TestCase):
@@ -145,14 +145,14 @@ class TestAnalysisFunctionsWithMockedLLM(unittest.TestCase):
         self.assertIsInstance(result, str)
 
     @patch("src.analysis.ai_analysis._call_groq")
-    def test_comparative_single_stock_uses_sector_benchmarking(self, mock_groq):
-        """Single stock should trigger sector benchmarking, not multi-stock comparison."""
-        mock_groq.return_value = "Sector benchmarking output."
+    def test_comparative_single_stock_uses_benchmarking(self, mock_groq):
+        """Single stock should trigger benchmark comparison, not multi-stock comparison."""
+        mock_groq.return_value = "Benchmarking output."
         from src.analysis.ai_analysis import generate_comparative_analysis
         result = generate_comparative_analysis(self.context)
-        # The prompt for single stock should include "Sector Benchmarking"
+        # The prompt for single stock should include "Benchmark Comparison"
         call_args = mock_groq.call_args[0][0]  # First positional arg = prompt
-        self.assertIn("Sector Benchmarking", call_args)
+        self.assertIn("Benchmark Comparison", call_args)
 
     @patch("src.analysis.ai_analysis._call_groq")
     def test_market_context_returns_string(self, mock_groq):

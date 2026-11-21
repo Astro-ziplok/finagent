@@ -236,6 +236,31 @@ if __name__ == "__main__":
 #  SOURCE 3: Free RSS News (no API key needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import re
+
+# Whole-word patterns (with common suffixes). Plain substring matching produced
+# false hits such as "up" in "update", "rise" in "enterprise", "gain" in "again".
+_POSITIVE_RE = re.compile(
+    r"\b(surg(e|es|ed|ing)|soar(s|ed|ing)?|gain(s|ed)?|beat(s)?|record|ris(e|es|ing)|rose|"
+    r"rall(y|ies|ied)|jump(s|ed)?|upgrade(s|d)?|outperform(s|ed)?|bullish)\b", re.I)
+_NEGATIVE_RE = re.compile(
+    r"\b(fall(s|ing)?|fell|drop(s|ped)?|miss(es|ed)?|loss(es)?|plung(e|es|ed)|slump(s|ed)?|"
+    r"tumbl(e|es|ed)|downgrade(s|d)?|cut(s)?|warn(s|ed|ing)?|lawsuit|probe|bearish|sell-?off)\b", re.I)
+
+
+def keyword_sentiment(title: str) -> str:
+    """Directional sentiment hint from a headline: Positive / Negative / Mixed / Neutral."""
+    pos = bool(_POSITIVE_RE.search(title or ""))
+    neg = bool(_NEGATIVE_RE.search(title or ""))
+    if pos and neg:
+        return "Mixed"
+    if pos:
+        return "Positive"
+    if neg:
+        return "Negative"
+    return "Neutral"
+
+
 def fetch_rss_news(tickers: list = None, max_articles: int = 5) -> pd.DataFrame:
     """
     Fetch financial news from free RSS feeds — no API key required.
@@ -301,13 +326,7 @@ def fetch_rss_news(tickers: list = None, max_articles: int = 5) -> pd.DataFrame:
                     title = entry.get("title", "")
 
                     # Simple keyword sentiment hint (not a score, just directional)
-                    title_lower = title.lower()
-                    if any(w in title_lower for w in ["surge", "soar", "gain", "beat", "record", "rise", "up"]):
-                        sentiment_hint = "Positive"
-                    elif any(w in title_lower for w in ["fall", "drop", "miss", "loss", "down", "cut", "warn"]):
-                        sentiment_hint = "Negative"
-                    else:
-                        sentiment_hint = "Neutral"
+                    sentiment_hint = keyword_sentiment(title)
 
                     all_articles.append({
                         "ticker":         ticker,

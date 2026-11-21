@@ -101,15 +101,30 @@ ROLLING_LONG     = 30
 BOLLINGER_WINDOW = 20
 BOLLINGER_STD    = 2
 
+# ── Risk / Benchmark Settings ─────────────────────────────────────────────────
+# Annual risk-free rate used in the Sharpe ratio (approx. 3-month US T-bill yield).
+# Update this occasionally to reflect current rates.
+RISK_FREE_RATE   = 0.04
+TRADING_DAYS     = 252
+# Market benchmark used for excess return, beta and correlation.
+BENCHMARK_TICKER = "SPY"
+
 # ── API Keys (loaded from .env) ───────────────────────────────────────────────
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
 
 # ── LLM Settings ─────────────────────────────────────────────────────────────
-GROQ_MODEL    = "llama-3.3-70b-versatile"
+# llama-3.3-70b-versatile has been retired by Groq. gpt-oss-120b is a reasoning
+# model: its hidden reasoning counts toward max_tokens, so every call adds
+# REASONING_TOKEN_BUFFER on top of the visible answer budget.
+# Override the model by setting GROQ_MODEL=... in .env.
+GROQ_MODEL    = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 MAX_TOKENS    = 1500
+REASONING_TOKEN_BUFFER = 1024
+# Extra request options for reasoning models ("low" keeps latency and token use down).
+GROQ_EXTRA_BODY = {"reasoning_effort": "low"} if "gpt-oss" in GROQ_MODEL else {}
 
 # ── Chart Settings ────────────────────────────────────────────────────────────
 CHART_DPI     = 150

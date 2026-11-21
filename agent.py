@@ -16,7 +16,8 @@ from openai import OpenAI
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL,
-                    REPORTS_ANALYSIS_DIR, REPORTS_CHARTS_DIR)
+                    REPORTS_ANALYSIS_DIR, REPORTS_CHARTS_DIR, BENCHMARK_TICKER,
+                    REASONING_TOKEN_BUFFER, GROQ_EXTRA_BODY)
 from src.collection.fetch_data import fetch_stock_prices, fetch_rss_news
 from src.cleaning.clean_data import clean_stock_dataframe
 from src.visualization.charts import (plot_price_and_volume, plot_bollinger_bands,
@@ -34,8 +35,9 @@ from src.analysis.ai_analysis import (generate_trend_summary, generate_anomaly_c
                                        generate_yfinance_cashflow_analysis,
                                        generate_key_metrics_dashboard,
                                        generate_rss_news_analysis,
-                                       _build_data_context, _call_groq)
-from src.fundamentals.alpha_vantage import fetch_all_fundamental_data, fetch_commodity_prices
+                                       _build_data_context, _call_groq, DISCLAIMER)
+from src.fundamentals.alpha_vantage import (fetch_all_fundamental_data, fetch_commodity_prices,
+                                            requests_sent)
 from src.fundamentals.yfinance_fundamentals import fetch_all_yfinance_fundamentals
 from src.fundamentals.quota import QuotaManager
 from src.export.report_exporter import export_report
@@ -74,9 +76,10 @@ Return ONLY valid JSON. No markdown.
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": system_prompt},
                       {"role": "user",   "content": user_message}],
-            max_tokens=200, temperature=0,
+            max_tokens=200 + (REASONING_TOKEN_BUFFER if GROQ_EXTRA_BODY else 0), temperature=0,
+            extra_body=GROQ_EXTRA_BODY or None,
         )
-        raw    = response.choices[0].message.content.strip()
+        raw    = (response.choices[0].message.content or "").strip()
         raw    = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(raw)
         parsed["tickers"]    = [t.upper() for t in parsed.get("tickers", [])]
@@ -86,7 +89,11 @@ Return ONLY valid JSON. No markdown.
         return parsed
     except Exception:
         EXCLUDED = {"OF","VS","TO","IN","AT","BY","FOR","AND","OR","THE","A","AN",
-                    "FROM","WITH","ON","IS","IT","BE","AS","DO","IF","SO","WE","MY","ME","US"}
+                    "FROM","WITH","ON","IS","IT","BE","AS","DO","IF","SO","WE","MY","ME","US",
+                    "SHOW","GIVE","FULL","NEWS","RISK","WHAT","HOW","ABOUT","STOCK","STOCKS",
+                    "TREND","REPORT","CASH","FLOW","SHEET","PRICE","PRICES","LATEST","TELL",
+                    "COMPARE","VERSUS","INCOME","BALANCE","ANALYSE","ANALYZE","PLEASE","THIS",
+                    "THAT","ARE","WHICH","YEAR","YEARS","SHOULD","INVEST","NOW","GET","CAN"}
         raw_tickers = re.findall(r'\b[A-Z]{2,5}\b', user_message.upper())
         tickers     = [t for t in raw_tickers if t not in EXCLUDED]
         msg = user_message.lower()
@@ -143,6 +150,15 @@ def get_price_data(tickers, start_year=None, end_year=None):
     return result
 
 
+def get_benchmark_data(start_year=None, end_year=None):
+    """
+    Price data for the market benchmark (SPY by default) over the same date
+    range, used for excess return, beta and correlation. Returns None on failure.
+    """
+    data = get_price_data([BENCHMARK_TICKER], start_year=start_year, end_year=end_year)
+    return data.get(BENCHMARK_TICKER)
+
+
 def get_yfinance_fundamentals(tickers):
     result = {}
     for ticker in tickers:
@@ -186,7 +202,7 @@ def get_commodity_data():
 def get_fundamental_data(tickers, intent="full"):
     print(quota.status_line())
     if quota.remaining == 0:
-        print("  Alpha Vantage quota exhausted. Resets at 7 AM Vietnam time.")
+        print("  Alpha Vantage quota exhausted. Resets tomorrow (tracked by local date).")
         return {}
     uncached = [t for t in tickers if t not in FUNDAMENTAL_CACHE]
     if not uncached:
@@ -196,9 +212,11 @@ def get_fundamental_data(tickers, intent="full"):
         print(f"  Only {quota.remaining} request(s) left.")
         return {}
     cost = len(uncached) * len(features)
-    print(f"  Fetching {features} for {uncached} ({cost} requests)...")
+    print(f"  Fetching {features} for {uncached} (up to {cost} requests)...")
+    sent_before = requests_sent()
     new_data = fetch_all_fundamental_data(uncached, features=features)
-    quota.record(cost)
+    # Record only requests that were actually sent to Alpha Vantage
+    quota.record(requests_sent() - sent_before)
     for ticker in uncached:
         if ticker in new_data:
             FUNDAMENTAL_CACHE[ticker] = new_data[ticker]
@@ -241,7 +259,26 @@ def generate_charts(cleaned_data, fundamental_data=None, intent=""):
 
 
 def run_analysis(cleaned_data, intent, fundamental_data=None,
-                 start_year=None, end_year=None):
+                 start_year=None, end_year=None, benchmark_df=None):
+    text = _run_analysis_sections(cleaned_data, intent, fundamental_data,
+                                  start_year, end_year, benchmark_df)
+    return text + "\n\n" + DISCLAIMER
+
+
+def _av_overview_section(ticker, fundamental_data, cleaned_data):
+    """Alpha Vantage overview analysis (ROE/ROA, analyst ratings) if it was fetched."""
+    av_t = (fundamental_data.get("av", {}) or {}).get(ticker, {}) or {}
+    if not av_t.get("overview"):
+        return None
+    price = None
+    if cleaned_data and ticker in cleaned_data:
+        price = round(float(cleaned_data[ticker]["Close"].iloc[-1]), 2)
+    return generate_fundamental_analysis(ticker, av_t["overview"], av_t.get("income") or {},
+                                         av_t.get("balance") or {}, current_price=price)
+
+
+def _run_analysis_sections(cleaned_data, intent, fundamental_data=None,
+                           start_year=None, end_year=None, benchmark_df=None):
     output = []
     if not isinstance(fundamental_data, dict):
         fundamental_data = {}
@@ -264,7 +301,7 @@ def run_analysis(cleaned_data, intent, fundamental_data=None,
     if not cleaned_data:
         return "No price data available."
 
-    context = _build_data_context(cleaned_data)
+    context = _build_data_context(cleaned_data, benchmark_df=benchmark_df)
     tickers = list(cleaned_data.keys())
 
     if intent in ("analyse", "full", "unknown"):
@@ -281,6 +318,10 @@ def run_analysis(cleaned_data, intent, fundamental_data=None,
                 output.append(f"\n-- {ticker} KEY METRICS DASHBOARD --")
                 output.append(generate_key_metrics_dashboard(ticker, yf_ticker["metrics"]))
             if intent == "full":
+                av_section = _av_overview_section(ticker, fundamental_data, cleaned_data)
+                if av_section:
+                    output.append(f"\n-- {ticker} FUNDAMENTAL RATIOS & ANALYST RATINGS (Alpha Vantage) --")
+                    output.append(av_section)
                 if yf_ticker.get("income"):
                     output.append(f"\n-- {ticker} INCOME STATEMENT --")
                     output.append(generate_yfinance_income_analysis(ticker, yf_ticker["income"]))
@@ -335,6 +376,10 @@ def run_analysis(cleaned_data, intent, fundamental_data=None,
             if td.get("metrics"):
                 output.append(f"\n-- {ticker} KEY METRICS --")
                 output.append(generate_key_metrics_dashboard(ticker, td["metrics"]))
+            av_section = _av_overview_section(ticker, fundamental_data, cleaned_data)
+            if av_section:
+                output.append(f"\n-- {ticker} FUNDAMENTAL RATIOS & ANALYST RATINGS (Alpha Vantage) --")
+                output.append(av_section)
 
     elif intent == "news":
         rss_news = fundamental_data.get("rss_news")
@@ -490,6 +535,11 @@ def main():
                 print("Agent: Could not retrieve price data. Turn on VPN and try again.\n")
                 continue
 
+            # Step 4b: Market benchmark (SPY) for excess return / beta
+            benchmark_df = None
+            if intent in ("analyse", "full", "unknown", "trend", "risk", "compare"):
+                benchmark_df = get_benchmark_data(start_year=start_year, end_year=end_year)
+
             # Step 5: All data sources
             fundamental_data = {"yfinance": {}, "av": {}, "rss_news": None}
 
@@ -515,7 +565,8 @@ def main():
             # Step 7: Analysis
             print("  Running AI analysis...\n")
             analysis = run_analysis(cleaned_data, intent, fundamental_data,
-                                    start_year=start_year, end_year=end_year)
+                                    start_year=start_year, end_year=end_year,
+                                    benchmark_df=benchmark_df)
 
             # Step 8: Output
             print("=" * 60)

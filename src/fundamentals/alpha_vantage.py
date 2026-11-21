@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.alphavantage.co/query"
 
+# Counts HTTP requests actually sent to Alpha Vantage this session, so the
+# quota tracker records real usage (skipped/failed-before-sending calls are free).
+_REQUESTS_SENT = 0
+
+
+def requests_sent() -> int:
+    """Total Alpha Vantage HTTP requests sent in this Python session."""
+    return _REQUESTS_SENT
+
 
 def _get(params: dict, label: str, feature: str = "unknown", ticker: str = "") -> dict:
     """
@@ -51,9 +60,11 @@ def _get(params: dict, label: str, feature: str = "unknown", ticker: str = "") -
         logger.warning("ALPHA_VANTAGE_KEY not set in .env — skipping Alpha Vantage call.")
         return {}
 
+    global _REQUESTS_SENT
     params["apikey"] = ALPHA_VANTAGE_KEY
 
     try:
+        _REQUESTS_SENT += 1
         response = requests.get(BASE_URL, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()
@@ -115,12 +126,15 @@ def fetch_news_sentiment(ticker: str, limit: int = 10) -> dict:
     for item in data.get("feed", [])[:limit]:
         # Find this ticker's specific sentiment score in the article
         ticker_sentiment = 0.0
+        ticker_label     = item.get("overall_sentiment_label", "Neutral")
         for ts in item.get("ticker_sentiment", []):
             if ts.get("ticker") == ticker:
                 try:
                     ticker_sentiment = float(ts.get("ticker_sentiment_score", 0))
-                except:
+                except (TypeError, ValueError):
                     ticker_sentiment = 0.0
+                # Label must match the ticker-specific score shown next to it
+                ticker_label = ts.get("ticker_sentiment_label", ticker_label)
                 break
 
         articles.append({
@@ -128,7 +142,7 @@ def fetch_news_sentiment(ticker: str, limit: int = 10) -> dict:
             "source":          item.get("source", ""),
             "published_at":    item.get("time_published", "")[:10],  # Date only
             "url":             item.get("url", ""),
-            "sentiment_label": item.get("overall_sentiment_label", "Neutral"),
+            "sentiment_label": ticker_label,
             "sentiment_score": round(ticker_sentiment, 4),
             "summary":         item.get("summary", "")[:200],  # First 200 chars
         })
@@ -202,7 +216,7 @@ def fetch_company_overview(ticker: str) -> dict:
         """Convert to float safely, return default if invalid."""
         try:
             f = float(val)
-            return round(f, 4) if f else default
+            return round(f, 4)
         except (TypeError, ValueError):
             return default
 
@@ -300,11 +314,12 @@ def fetch_income_statement(ticker: str) -> dict:
     quarters = []
     for report in data["quarterlyReports"][:4]:  # Last 4 quarters
         def sv(key):
+            # Missing values become None (not 0) so they can't be mistaken for real zeros
             try:
-                v = report.get(key, "0")
-                return int(float(v)) if v and v != "None" else 0
-            except:
-                return 0
+                v = report.get(key)
+                return int(float(v)) if v not in (None, "", "None") else None
+            except (TypeError, ValueError):
+                return None
 
         quarters.append({
             "fiscal_date":      report.get("fiscalDateEnding", ""),
@@ -347,11 +362,12 @@ def fetch_balance_sheet(ticker: str) -> dict:
     quarters = []
     for report in data["quarterlyReports"][:4]:
         def sv(key):
+            # Missing values become None (not 0) so they can't be mistaken for real zeros
             try:
-                v = report.get(key, "0")
-                return int(float(v)) if v and v != "None" else 0
-            except:
-                return 0
+                v = report.get(key)
+                return int(float(v)) if v not in (None, "", "None") else None
+            except (TypeError, ValueError):
+                return None
 
         quarters.append({
             "fiscal_date":        report.get("fiscalDateEnding", ""),

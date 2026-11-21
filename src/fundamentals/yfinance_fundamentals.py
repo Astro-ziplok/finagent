@@ -36,6 +36,26 @@ def _safe_val(val, round_digits=2):
         return None
 
 
+def _to_pct(decimal_val, digits=2):
+    """Convert a decimal ratio (0.4879) to a percentage (48.79). None-safe."""
+    return round(decimal_val * 100, digits) if decimal_val is not None else None
+
+
+def _dividend_yield_pct(info: dict):
+    """
+    Dividend yield as a percentage, robust to yfinance unit changes.
+    Newer yfinance returns `dividendYield` already in percent (0.41 = 0.41%),
+    older versions returned a decimal. Computing it from the dividend rate and
+    price avoids the ambiguity entirely.
+    """
+    rate  = _safe_val(info.get("dividendRate"), 6)
+    price = _safe_val(info.get("currentPrice") or info.get("regularMarketPrice"), 6)
+    if rate and price:
+        return round(rate / price * 100, 2)
+    trailing = _safe_val(info.get("trailingAnnualDividendYield"), 6)  # always a decimal
+    return _to_pct(trailing) if trailing else None
+
+
 def _fmt_millions(val) -> str:
     """Format a large number into readable millions/billions string."""
     if val is None:
@@ -115,11 +135,13 @@ def fetch_income_statement(ticker: str) -> dict:
                     "rd_expense":       rd,
                     # Calculated margins
                     "gross_margin_pct":    round(gross_profit / total_rev * 100, 2)
-                                          if gross_profit and total_rev else None,
+                                          if gross_profit is not None and total_rev else None,
                     "net_margin_pct":      round(net_income / total_rev * 100, 2)
-                                          if net_income and total_rev else None,
+                                          if net_income is not None and total_rev else None,
                     "operating_margin_pct":round(op_income / total_rev * 100, 2)
-                                          if op_income and total_rev else None,
+                                          if op_income is not None and total_rev else None,
+                    "rd_pct_of_revenue":   round(rd / total_rev * 100, 2)
+                                          if rd is not None and total_rev else None,
                     # Formatted for display
                     "revenue_fmt":      _fmt_millions(total_rev),
                     "net_income_fmt":   _fmt_millions(net_income),
@@ -128,19 +150,20 @@ def fetch_income_statement(ticker: str) -> dict:
             return rows
 
         annual_rows    = extract_rows(annual_df, max_periods=4)
-        quarterly_rows = extract_rows(quarterly_df, max_periods=4) if (
+        # 5 quarters so the latest quarter can be compared with the same quarter last year
+        quarterly_rows = extract_rows(quarterly_df, max_periods=5) if (
             quarterly_df is not None and not quarterly_df.empty) else []
 
         # YoY growth metrics (most recent vs prior year)
         yoy_growth = {}
         if len(annual_rows) >= 2:
             curr, prev = annual_rows[0], annual_rows[1]
+            gm_c, gm_p = curr["gross_margin_pct"], prev["gross_margin_pct"]
             yoy_growth = {
                 "revenue_growth_pct":    _pct_change(curr["total_revenue"], prev["total_revenue"]),
                 "net_income_growth_pct": _pct_change(curr["net_income"], prev["net_income"]),
-                "gross_margin_change":   round(
-                    (curr["gross_margin_pct"] or 0) - (prev["gross_margin_pct"] or 0), 2
-                ),
+                "gross_margin_change_pct_points":
+                    round(gm_c - gm_p, 2) if (gm_c is not None and gm_p is not None) else None,
             }
 
         result = {
@@ -213,9 +236,25 @@ def fetch_balance_sheet(ticker: str) -> dict:
                                      "Short Long Term Debt", "ShortLongTermDebt"])
                 retained      = get(["Retained Earnings", "RetainedEarnings"])
 
-                # Debt-to-equity ratio
-                de_ratio = round(float(lt_debt or 0) / float(equity) * 100, 2) \
-                           if equity and equity != 0 else None
+                total_debt_reported = get(["Total Debt", "TotalDebt"])
+
+                # Total debt: prefer Yahoo's reported figure (includes leases),
+                # otherwise long-term + current debt. Using total debt keeps this
+                # consistent with the debt-to-equity in the key metrics dashboard.
+                total_debt = total_debt_reported
+                if total_debt is None and (lt_debt is not None or st_debt is not None):
+                    total_debt = (lt_debt or 0) + (st_debt or 0)
+
+                # Debt-to-equity as a multiple (e.g. 1.34x). Negative equity makes
+                # the ratio meaningless, so report None in that case.
+                de_ratio = round(total_debt / equity, 2) \
+                           if (total_debt is not None and equity and equity > 0) else None
+
+                current_assets = get(["Current Assets", "CurrentAssets", "Total Current Assets"])
+                current_liab   = get(["Current Liabilities", "CurrentLiabilities",
+                                      "Total Current Liabilities"])
+                current_ratio  = round(current_assets / current_liab, 2) \
+                                 if current_assets and current_liab else None
 
                 row.update({
                     "total_assets":       total_assets,
@@ -224,13 +263,17 @@ def fetch_balance_sheet(ticker: str) -> dict:
                     "cash":               cash,
                     "long_term_debt":     lt_debt,
                     "short_term_debt":    st_debt,
+                    "total_debt":         total_debt,
+                    "net_cash":           (cash - total_debt) if (cash is not None and total_debt is not None) else None,
                     "retained_earnings":  retained,
-                    "de_ratio_pct":       de_ratio,
+                    "debt_to_equity_x":   de_ratio,
+                    "current_ratio_x":    current_ratio,
                     # Formatted
                     "assets_fmt":         _fmt_millions(total_assets),
                     "equity_fmt":         _fmt_millions(equity),
                     "cash_fmt":           _fmt_millions(cash),
                     "lt_debt_fmt":        _fmt_millions(lt_debt),
+                    "total_debt_fmt":     _fmt_millions(total_debt),
                 })
                 rows.append(row)
             return rows
@@ -302,10 +345,13 @@ def fetch_cash_flow(ticker: str) -> dict:
                 capex   = get(["Capital Expenditure", "CapitalExpenditure",
                                 "Capital Expenditures"])
                 fcf     = get(["Free Cash Flow", "FreeCashFlow"])
+                buyback = get(["Repurchase Of Capital Stock", "RepurchaseOfCapitalStock"])
+                divs    = get(["Cash Dividends Paid", "CashDividendsPaid",
+                               "Common Stock Dividend Paid"])
 
                 # Calculate FCF if not directly available
-                if fcf is None and op_cf and capex:
-                    fcf = round(op_cf + capex, 2)  # capex is usually negative
+                if fcf is None and op_cf is not None and capex is not None:
+                    fcf = round(op_cf + capex, 2)  # capex is reported as negative
 
                 row.update({
                     "operating_cf":  op_cf,
@@ -313,6 +359,12 @@ def fetch_cash_flow(ticker: str) -> dict:
                     "financing_cf":  fin_cf,
                     "capex":         capex,
                     "free_cash_flow":fcf,
+                    "share_buybacks":  buyback,   # negative = cash spent on buybacks
+                    "dividends_paid":  divs,      # negative = cash paid out
+                    "capex_pct_of_operating_cf": round(abs(capex) / op_cf * 100, 2)
+                                                 if (capex is not None and op_cf and op_cf > 0) else None,
+                    "buybacks_fmt":    _fmt_millions(buyback),
+                    "dividends_fmt":   _fmt_millions(divs),
                     # Formatted
                     "operating_cf_fmt":   _fmt_millions(op_cf),
                     "fcf_fmt":            _fmt_millions(fcf),
@@ -372,29 +424,37 @@ def fetch_key_metrics(ticker: str) -> dict:
         stock = yf.Ticker(ticker)
         info  = stock.info or {}
 
-        def gi(key, default=None):
+        def gi(key, default=None, digits=2):
             v = info.get(key, default)
-            return _safe_val(v) if v is not None else default
+            return _safe_val(v, digits) if v is not None else default
+
+        def gdec(key):
+            """Decimal ratio fields (margins, growth): keep full precision."""
+            return gi(key, digits=6)
 
         # Basic info
         name     = info.get("longName", ticker)
         sector   = info.get("sector", "N/A")
         industry = info.get("industry", "N/A")
 
-        # EPS metrics
+        # EPS metrics. NOTE: forward vs trailing EPS is the growth analysts
+        # EXPECT over the next 12 months, not historical growth.
         eps_ttm      = gi("trailingEps")
         eps_forward  = gi("forwardEps")
         eps_growth   = _pct_change(eps_forward, eps_ttm) if eps_ttm and eps_forward else None
 
-        # Revenue
+        # Revenue. yfinance `revenueGrowth` = most recent quarter vs the same
+        # quarter a year earlier (YoY), as a decimal.
         revenue_ttm  = gi("totalRevenue")
-        revenue_qoq  = gi("revenueGrowth")   # Already a decimal (e.g. 0.12 = 12%)
-        revenue_yoy  = round(float(revenue_qoq) * 100, 2) if revenue_qoq else None
+        revenue_yoy  = _to_pct(gdec("revenueGrowth"))
+        earnings_yoy = _to_pct(gdec("earningsQuarterlyGrowth"))
 
-        # Profitability
-        profit_margin   = gi("profitMargins")
-        gross_margin    = gi("grossMargins")
-        operating_margin= gi("operatingMargins")
+        # Profitability (decimals at full precision, converted once to %)
+        profit_margin   = gdec("profitMargins")
+        gross_margin    = gdec("grossMargins")
+        operating_margin= gdec("operatingMargins")
+        roe             = gdec("returnOnEquity")
+        roa             = gdec("returnOnAssets")
 
         # Valuation
         pe_trailing  = gi("trailingPE")
@@ -405,7 +465,10 @@ def fetch_key_metrics(ticker: str) -> dict:
 
         # Balance sheet quick metrics
         current_ratio = gi("currentRatio")
-        de_ratio      = gi("debtToEquity")
+        # Yahoo reports debtToEquity in PERCENT (84.3 means 0.84x). Convert to
+        # a multiple so it can't be misread as "84 times equity".
+        de_raw        = gi("debtToEquity", digits=4)
+        de_ratio      = round(de_raw / 100, 2) if de_raw is not None else None
         beta          = gi("beta")
 
         # Market data
@@ -413,7 +476,7 @@ def fetch_key_metrics(ticker: str) -> dict:
         current_price     = gi("currentPrice") or gi("regularMarketPrice")
         target_price      = gi("targetMeanPrice")
         upside_pct        = _pct_change(target_price, current_price) if target_price and current_price else None
-        dividend_yield    = gi("dividendYield")
+        dividend_yield    = _dividend_yield_pct(info)
 
         # FCF yield (FCF / Market Cap)
         fcf               = gi("freeCashflow")
@@ -446,23 +509,29 @@ def fetch_key_metrics(ticker: str) -> dict:
             "earnings": {
                 "eps_ttm":           eps_ttm,
                 "eps_forward":       eps_forward,
+                # Kept under the old key for chart compatibility; this is EXPECTED growth
                 "eps_growth_pct":    eps_growth,
+                "eps_growth_basis":  "forward EPS vs trailing EPS (analyst-expected growth, not historical)",
+                "earnings_growth_last_quarter_yoy_pct": earnings_yoy,
             },
             "growth": {
                 "revenue_yoy_pct":   revenue_yoy,
+                "revenue_growth_basis": "most recent quarter vs same quarter one year earlier",
                 "revenue_ttm":       revenue_ttm,
                 "revenue_ttm_fmt":   _fmt_millions(revenue_ttm),
             },
             "profitability": {
-                "profit_margin_pct":    round(float(profit_margin)*100, 2) if profit_margin else None,
-                "gross_margin_pct":     round(float(gross_margin)*100, 2) if gross_margin else None,
-                "operating_margin_pct": round(float(operating_margin)*100, 2) if operating_margin else None,
+                "profit_margin_pct":    _to_pct(profit_margin),
+                "gross_margin_pct":     _to_pct(gross_margin),
+                "operating_margin_pct": _to_pct(operating_margin),
+                "roe_pct":              _to_pct(roe),
+                "roa_pct":              _to_pct(roa),
                 "fcf_yield_pct":        fcf_yield,
                 "fcf_fmt":              _fmt_millions(fcf),
             },
             "financial_health": {
-                "current_ratio":     current_ratio,
-                "debt_to_equity":    de_ratio,
+                "current_ratio_x":   current_ratio,
+                "debt_to_equity_x":  de_ratio,
             },
             "analyst": {
                 "recommendation":    rec,
@@ -473,7 +542,7 @@ def fetch_key_metrics(ticker: str) -> dict:
                 "n_analysts":        n_analysts,
             },
             "dividend": {
-                "dividend_yield_pct": round(float(dividend_yield)*100, 2) if dividend_yield else None,
+                "dividend_yield_pct": dividend_yield,
             },
             "source": "Yahoo Finance (yfinance)",
         }

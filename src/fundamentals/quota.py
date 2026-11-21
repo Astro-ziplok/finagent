@@ -85,9 +85,9 @@ class QuotaManager:
         Returns a coloured progress bar showing today's quota usage.
 
         Examples:
-          🟢 Alpha Vantage: 4/25 used  [███░░░░░░░░░░░░░░░░░] 21 remaining  (resets midnight UTC)
-          🟡 Alpha Vantage: 18/25 used [██████████████░░░░░░] 7 remaining   (resets midnight UTC)
-          🔴 Alpha Vantage: 25/25 used [████████████████████] 0 remaining   (resets midnight UTC)
+          🟢 Alpha Vantage: 4/25 used  [███░░░░░░░░░░░░░░░░░] 21 remaining  (resets daily, local date)
+          🟡 Alpha Vantage: 18/25 used [██████████████░░░░░░] 7 remaining   (resets daily, local date)
+          🔴 Alpha Vantage: 25/25 used [████████████████████] 0 remaining   (resets daily, local date)
         """
         pct         = self.used / DAILY_LIMIT
         bar_filled  = int(pct * 20)
@@ -101,7 +101,8 @@ class QuotaManager:
         else:
             icon = "🔴"
 
-        note = " ← refill at midnight UTC" if remaining <= 3 else "  (resets midnight UTC)"
+        # Usage is tracked per calendar day on this computer's local clock.
+        note = " ← resets tomorrow (local date)" if remaining <= 3 else "  (resets daily, local date)"
         return (
             f"  {icon} Alpha Vantage: {self.used}/{DAILY_LIMIT} used "
             f"[{bar}] {remaining} remaining{note}"
@@ -127,7 +128,12 @@ class QuotaManager:
             "full":         ["overview", "income", "news", "balance"],
             "analyse":      ["overview", "news"],
         }
-        wanted = intent_features.get(intent, ["overview", "income", "news", "balance"])
+        # NOTE: yfinance already supplies full income/balance/cash-flow statements
+        # for free, so Alpha Vantage is only used for what it adds: the company
+        # overview (ROE/ROA, analyst ratings) and scored news sentiment.
+        intent_features = {k: [f for f in v if f in ("overview", "news")]
+                           for k, v in intent_features.items()}
+        wanted = intent_features.get(intent, ["overview", "news"])
 
         affordable = []
         budget = self.remaining
