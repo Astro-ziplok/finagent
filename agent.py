@@ -58,7 +58,7 @@ def parse_user_intent(user_message: str) -> dict:
 You are a financial assistant extracting structured info from user messages.
 Return ONLY a JSON object with:
 - "tickers": list of ticker symbols (convert Apple->AAPL, Tesla->TSLA, Microsoft->MSFT, Google->GOOGL, Amazon->AMZN, Meta->META, Netflix->NFLX, Nvidia->NVDA)
-- "intent": one of: analyse, compare, risk, trend, full, news, fundamentals, income, balance, cashflow, commodities, sectors, unknown
+- "intent": one of: analyse, compare, risk, trend, full, news, fundamentals, income, balance, cashflow, valuation, commodities, sectors, unknown
 - "start_year": integer or null
 - "end_year": integer or null
 
@@ -66,6 +66,7 @@ Rules:
 - "cash flow","cashflow","FCF" -> "cashflow" (NEVER "balance")
 - "income statement","revenue","earnings" -> "income"
 - "balance sheet","assets","liabilities" -> "balance"
+- "valuation","fair value","intrinsic value","DCF","worth","overvalued","undervalued","cheap","expensive" -> "valuation"
 - "commodity","oil price","gold" -> "commodities" with empty tickers []
 - "sectors","sector rotation" -> "sectors" with empty tickers []
 
@@ -105,6 +106,8 @@ Return ONLY valid JSON. No markdown.
             fi = "balance"
         elif any(w in msg for w in ["compare","vs","versus"]):
             fi = "compare"
+        elif any(w in msg for w in ["valuation","fair value","intrinsic","dcf","worth","overvalued","undervalued"]):
+            fi = "valuation"
         elif any(w in msg for w in ["risk","volatility"]):
             fi = "risk"
         else:
@@ -420,6 +423,19 @@ def _run_analysis_sections(cleaned_data, intent, fundamental_data=None,
             output.append(f"\n-- {ticker} BALANCE SHEET --")
             output.append(generate_yfinance_balance_analysis(ticker, balance))
 
+    elif intent == "valuation":
+        from src.valuation.engine import value_company
+        from src.valuation.summary import format_valuation
+        yf_data = fundamental_data.get("yfinance", {})
+        for ticker in tickers:
+            print(f"  Valuing {ticker}...")
+            try:
+                output.append(format_valuation(value_company(ticker, yf_data.get(ticker) or {})))
+            except Exception as e:
+                output.append(f"\n-- {ticker} VALUATION --\nValuation failed: {e}")
+        output.append("\nFor the full write-up with charts, sensitivity tables and sources, "
+                      "answer 'yes' to the research report question below.")
+
     elif intent == "cashflow":
         yf_data = fundamental_data.get("yfinance", {})
         for ticker in tickers:
@@ -500,6 +516,7 @@ def print_banner():
     print('    "Show me commodity prices"')
     print('    "What sectors should I invest in right now?"')
     print('    "Compare AAPL and MSFT from 2020 to 2023"')
+    print('    "What is Apple worth?"  /  "Is NVDA overvalued?"')
     print("\n  Type 'help' to see this again. Type 'quit' to exit.")
     print("=" * 60 + "\n")
 
@@ -577,7 +594,7 @@ def main():
             fundamental_data = {"yfinance": {}, "av": {}, "rss_news": None}
 
             if intent in ("full","fundamentals","income","balance",
-                          "cashflow","analyse","unknown","compare"):
+                          "cashflow","analyse","unknown","compare","valuation"):
                 print("  Fetching financial statements (Yahoo Finance, free)...")
                 fundamental_data["yfinance"] = get_yfinance_fundamentals(tickers)
 

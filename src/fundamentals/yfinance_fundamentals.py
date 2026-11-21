@@ -126,6 +126,10 @@ def fetch_income_statement(ticker: str) -> dict:
                 rd           = get(["Research Development", "ResearchAndDevelopment",
                                     "Research And Development"])
                 eps_diluted  = get(["Diluted EPS", "DilutedEPS"])
+                interest_exp = get(["Interest Expense", "InterestExpense",
+                                    "Interest Expense Non Operating"])
+                pretax       = get(["Pretax Income", "PretaxIncome"])
+                tax_prov     = get(["Tax Provision", "TaxProvision"])
 
                 row.update({
                     "total_revenue":    total_rev,
@@ -135,6 +139,9 @@ def fetch_income_statement(ticker: str) -> dict:
                     "ebitda":           ebitda,
                     "rd_expense":       rd,
                     "diluted_eps":      eps_diluted,
+                    "interest_expense": interest_exp,
+                    "pretax_income":    pretax,
+                    "tax_provision":    tax_prov,
                     # Calculated margins
                     "gross_margin_pct":    round(gross_profit / total_rev * 100, 2)
                                           if gross_profit is not None and total_rev else None,
@@ -239,6 +246,9 @@ def fetch_balance_sheet(ticker: str) -> dict:
                 retained      = get(["Retained Earnings", "RetainedEarnings"])
 
                 total_debt_reported = get(["Total Debt", "TotalDebt"])
+                cash_sti      = get(["Cash Cash Equivalents And Short Term Investments",
+                                     "CashCashEquivalentsAndShortTermInvestments"])
+                shares_out    = get(["Ordinary Shares Number", "Share Issued"])
 
                 # Total debt: prefer Yahoo's reported figure (includes leases),
                 # otherwise long-term + current debt. Using total debt keeps this
@@ -269,6 +279,8 @@ def fetch_balance_sheet(ticker: str) -> dict:
                     "net_cash":           (cash - total_debt) if (cash is not None and total_debt is not None) else None,
                     "retained_earnings":  retained,
                     "debt_to_equity_x":   de_ratio,
+                    "cash_and_st_investments": cash_sti,
+                    "shares_outstanding": shares_out,
                     "current_ratio_x":    current_ratio,
                     # Formatted
                     "assets_fmt":         _fmt_millions(total_assets),
@@ -350,6 +362,7 @@ def fetch_cash_flow(ticker: str) -> dict:
                 buyback = get(["Repurchase Of Capital Stock", "RepurchaseOfCapitalStock"])
                 divs    = get(["Cash Dividends Paid", "CashDividendsPaid",
                                "Common Stock Dividend Paid"])
+                sbc     = get(["Stock Based Compensation", "StockBasedCompensation"])
 
                 # Calculate FCF if not directly available
                 if fcf is None and op_cf is not None and capex is not None:
@@ -363,6 +376,7 @@ def fetch_cash_flow(ticker: str) -> dict:
                     "free_cash_flow":fcf,
                     "share_buybacks":  buyback,   # negative = cash spent on buybacks
                     "dividends_paid":  divs,      # negative = cash paid out
+                    "stock_based_comp": sbc,      # non-cash expense added back in operating CF
                     "capex_pct_of_operating_cf": round(abs(capex) / op_cf * 100, 2)
                                                  if (capex is not None and op_cf and op_cf > 0) else None,
                     "buybacks_fmt":    _fmt_millions(buyback),

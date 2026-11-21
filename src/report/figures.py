@@ -446,3 +446,102 @@ def risk_matrix(risks: list, path: Path) -> bool:
     for s in ax.spines.values():
         s.set_visible(False)
     return _save(fig, path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Valuation figures
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SHORT = {"dcf": "DCF (FCFF)", "ri": "Residual income", "ddm": "DDM", "comps": "Peer multiples",
+          "regression": "Peer regression", "history": "Own P/E history"}
+
+
+def football_field(valuations: dict, path: Path) -> bool:
+    """
+    Value range of each method against today's price (reference: 'Football Field').
+    One company: dollar axis. Several companies: % versus each one's own price.
+    """
+    rows = []
+    multi = len(valuations) > 1
+    for t, v in valuations.items():
+        price = v.get("price")
+        if not price:
+            continue
+        scale = (lambda x: (x / price - 1) * 100) if multi else (lambda x: x)
+        for k, m in v["methods"].items():
+            if "value" not in m:
+                continue
+            lo = m.get("low") if m.get("low") is not None else m["value"]
+            hi = m.get("high") if m.get("high") is not None else m["value"]
+            rows.append((f"{t} {_SHORT[k]}" if multi else _SHORT[k], scale(lo), scale(m["value"]), scale(hi),
+                         m.get("role") == "weighted"))
+        if v.get("range_52w"):
+            lo, hi = v["range_52w"]
+            rows.append((f"{t} 52-week range" if multi else "52-week range", scale(lo), None, scale(hi), False))
+        if v.get("fair_value"):
+            rows.append((f"{t} Weighted fair value" if multi else "Weighted fair value",
+                         scale(v["fair_low"]), scale(v["fair_value"]), scale(v["fair_high"]), "fair"))
+    if not rows:
+        return False
+    fig, ax = plt.subplots(figsize=(FIGSIZE[0], 0.9 + 0.32 * len(rows)))
+    for i, (label, lo, mid, hi, kind) in enumerate(rows):
+        color = DEEP if kind == "fair" else (RED if kind else GREY)
+        ax.barh(i, hi - lo, left=lo, height=0.55, color=color, alpha=0.9 if kind else 0.7)
+        if mid is not None:
+            ax.plot([mid, mid], [i - 0.3, i + 0.3], color="white" if kind else DARK, lw=1.6)
+    ref = 0 if multi else next(iter(valuations.values()))["price"]
+    ax.axvline(ref, color=DARK, lw=1, ls="--")
+    ax.text(ref, len(rows) - 0.4, " price today" if not multi else " today's price", fontsize=6, color=DARK, va="bottom")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([r[0] for r in rows])
+    ax.invert_yaxis()
+    ax.set_xlabel("% vs current price" if multi else "Value per share (USD)", fontsize=7)
+    ax.grid(axis="x", color=LIGHT, linewidth=0.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(labelsize=6.5, colors=DARK, length=2)
+    return _save(fig, path)
+
+
+def peer_regression(reg: dict, ticker: str, path: Path) -> bool:
+    """Peer multiple vs fundamental with the fitted line; the company highlighted."""
+    if not reg or not reg.get("points"):
+        return False
+    xs = [p[0] * (100 if "growth" in reg["x_label"].lower() or reg["x_label"] == "ROE" else 1) for p in reg["points"]]
+    ys = [p[1] for p in reg["points"]]
+    pct = "growth" in reg["x_label"].lower() or reg["x_label"] == "ROE"
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    ax.scatter(xs, ys, color=GREY, s=22, zorder=3)
+    for name, x, y in zip(reg.get("peer_names", []), xs, ys):
+        ax.annotate(name, (x, y), textcoords="offset points", xytext=(3, 3), fontsize=5.5, color=DARK)
+    gx = np.linspace(min(xs + [reg["target"][0] * (100 if pct else 1)]),
+                     max(xs + [reg["target"][0] * (100 if pct else 1)]), 50)
+    ax.plot(gx, reg["intercept"] + reg["slope"] * (gx / (100 if pct else 1)), color=GREY, ls=":", lw=1.2)
+    tx, ty = reg["target"]
+    if tx is not None and ty is not None:
+        ax.scatter([tx * (100 if pct else 1)], [ty], color=RED, s=45, zorder=4)
+        ax.annotate(ticker, (tx * (100 if pct else 1), ty), textcoords="offset points", xytext=(4, -9),
+                    fontsize=6.5, color=RED, fontweight="bold")
+    ax.text(0.02, 0.95, f"y = {reg['intercept']:.1f} + {reg['slope'] / (100 if pct else 1):.2f}x   R² = {reg['r2']:.2f}   n = {reg['n']}",
+            transform=ax.transAxes, fontsize=6, color=DARK, va="top")
+    ax.margins(x=0.12, y=0.18)   # keep the highlighted company and its label inside the frame
+    ax.set_xlabel(reg["x_label"] + (" (%)" if pct else ""), fontsize=7)
+    ax.set_ylabel(reg["y_label"] + " (x)", fontsize=7)
+    _style(ax)
+    return _save(fig, path)
+
+
+def pe_history(hist: dict, path: Path) -> bool:
+    """Trailing P/E over time with its mean and +/- 1 standard deviation band."""
+    if not hist or hist.get("series") is None or len(hist["series"]) < 12:
+        return False
+    s = hist["series"]
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    ax.plot(s.index, s.values, color=RED, lw=1.3, label="Trailing P/E")
+    ax.axhline(hist["mean"], color=DARK, lw=1, label=f"Mean {hist['mean']:.1f}x")
+    ax.axhline(hist["mean"] + hist["std"], color=GREY, lw=0.9, ls="--", label="+/- 1 std. dev.")
+    ax.axhline(hist["mean"] - hist["std"], color=GREY, lw=0.9, ls="--")
+    _style(ax)
+    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%m/%y"))
+    _legend(ax)
+    return _save(fig, path)

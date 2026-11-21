@@ -74,6 +74,7 @@ class QuotaManager:
 
     def record(self, n: int = 1):
         """Record that n requests were used."""
+        self._load()   # re-read first: other modules (e.g. valuation) may have recorded usage
         self.used = min(self.used + n, DAILY_LIMIT)
         self._save()
 

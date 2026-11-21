@@ -109,6 +109,128 @@ TRADING_DAYS     = 252
 # Market benchmark used for excess return, beta and correlation.
 BENCHMARK_TICKER = "SPY"
 
+# ── Valuation Assumptions ─────────────────────────────────────────────────────
+# Every assumption below is printed with its source in each research report.
+# Change a value here and the report's citation table changes with it.
+VALUATION_ASSUMPTIONS = {
+    "equity_risk_premium": {
+        "value": 0.050,
+        "source": ("FinAgent default. Consistent with Kroll's recommended U.S. equity risk premium "
+                   "of 5.0% (2024) and within Damodaran's implied ERP range for the S&P 500 "
+                   "(about 4-5% in recent years)."),
+    },
+    "terminal_growth": {
+        "value": 0.025,
+        "source": ("FinAgent default. Conservative versus long-run U.S. nominal GDP growth of about "
+                   "3.8% (Federal Reserve 2% inflation objective + CBO long-term potential real "
+                   "growth of roughly 1.8%)."),
+    },
+    "forecast_years": {
+        "value": 10,
+        "source": ("FinAgent default. Ten-year explicit forecast (as used by Damodaran for firms with "
+                   "durable growth); years 1-2 follow analyst consensus, later years fade linearly to "
+                   "terminal growth, avoiding an abrupt drop to terminal growth."),
+    },
+    "beta_adjustment": {
+        "value": 0.67,
+        "source": ("Blume (1971) adjustment toward the market beta of 1.0, as reported by Bloomberg: "
+                   "adjusted beta = 0.67 x raw beta + 0.33."),
+    },
+    "risk_free_fallback": {
+        "value": 0.045,
+        "source": "FinAgent fallback, used only if the live 10-year Treasury yield cannot be fetched.",
+    },
+    "credit_spread_fallback": {
+        "value": 0.010,
+        "source": ("FinAgent fallback: risk-free rate + 1.0% (typical investment-grade spread), used "
+                   "when interest expense is not reported separately."),
+    },
+    "tax_rate_fallback": {
+        "value": 0.21,
+        "source": "U.S. federal statutory corporate tax rate (Tax Cuts and Jobs Act, 2017).",
+    },
+    "scenario_growth_shift": {
+        "value": 0.03,
+        "source": "FinAgent default: bull/bear cases add/subtract 3 percentage points of revenue growth each year.",
+    },
+    "scenario_margin_shift": {
+        "value": 0.10,
+        "source": "FinAgent default: bull/bear cases raise/lower the free-cash-flow margin by 10% (relative).",
+    },
+}
+
+# Which methods value which kind of company, and how they are weighted in the
+# fair-value estimate. Weights are re-scaled if a method cannot be computed.
+VALUATION_WEIGHTS = {
+    "cash_generative": {"dcf": 0.5, "comps": 0.5},
+    "financial":       {"ri": 0.5, "comps": 0.5},
+    "dividend":        {"ddm": 0.4, "dcf": 0.3, "comps": 0.3},
+    "high_growth":     {"comps": 1.0},
+}
+DIVIDEND_MIN_YIELD  = 0.020   # dividend payer = yield >= 2.0% ...
+DIVIDEND_MIN_PAYOUT = 0.40    # ... and payout ratio >= 40%
+FINANCIAL_INDUSTRY_KEYWORDS = ("Banks", "Insurance", "Capital Markets", "Asset Management", "Mortgage")
+
+# ── Peer Groups for Comparable-Company Valuation ──────────────────────────────
+# Default: companies in the same Yahoo Finance industry (labels verified Nov 2026,
+# listed largest first). If an industry has fewer than 3 peers, the peer set is
+# widened to the largest companies in the same sector. Edit freely.
+INDUSTRY_PEERS = {
+    ("Technology", "Semiconductors"): ["NVDA", "TSM", "AVGO", "AMD", "MU", "INTC", "TXN", "ADI", "ARM", "QCOM", "MRVL"],
+    ("Technology", "Semiconductor Equipment & Materials"): ["ASML"],
+    ("Technology", "Software - Infrastructure"): ["MSFT", "PLTR", "ORCL", "PANW", "CRWD", "FTNT", "SNPS"],
+    ("Technology", "Software - Application"): ["SAP", "SHOP", "UBER", "CRM", "NOW", "ADBE", "CDNS", "INTU"],
+    ("Technology", "Consumer Electronics"): ["AAPL", "SONY"],
+    ("Technology", "Computer Hardware"): ["ANET", "DELL", "HPQ", "SMCI"],
+    ("Technology", "Communication Equipment"): ["CSCO", "HPE"],
+    ("Technology", "Information Technology Services"): ["IBM", "FIS"],
+    ("Communication Services", "Internet Content & Information"): ["GOOGL", "META", "SPOT"],
+    ("Communication Services", "Entertainment"): ["NFLX", "DIS", "WBD", "ROKU"],
+    ("Communication Services", "Telecom Services"): ["T", "VZ", "TMUS", "CMCSA", "CHTR"],
+    ("Consumer Cyclical", "Internet Retail"): ["AMZN", "BABA", "PDD", "MELI", "EBAY", "JD", "ETSY"],
+    ("Consumer Cyclical", "Auto Manufacturers"): ["TSLA", "TM", "GM", "F", "HMC", "RIVN", "STLA"],
+    ("Consumer Cyclical", "Restaurants"): ["MCD", "SBUX", "CMG"],
+    ("Consumer Cyclical", "Home Improvement Retail"): ["HD", "LOW"],
+    ("Consumer Cyclical", "Travel Services"): ["BKNG", "ABNB"],
+    ("Consumer Defensive", "Discount Stores"): ["WMT", "COST", "TGT"],
+    ("Consumer Defensive", "Beverages - Non-Alcoholic"): ["KO", "PEP"],
+    ("Consumer Defensive", "Household & Personal Products"): ["PG", "CL"],
+    ("Consumer Defensive", "Tobacco"): ["PM", "MO"],
+    ("Financial Services", "Banks - Diversified"): ["JPM", "BAC", "WFC", "C"],
+    ("Financial Services", "Banks - Regional"): ["USB", "PNC", "TFC"],
+    ("Financial Services", "Capital Markets"): ["MS", "GS", "SCHW"],
+    ("Financial Services", "Credit Services"): ["V", "MA", "AXP", "COF", "PYPL", "SYF"],
+    ("Healthcare", "Drug Manufacturers - General"): ["LLY", "JNJ", "ABBV", "MRK", "AMGN", "PFE"],
+    ("Energy", "Oil & Gas Integrated"): ["XOM", "CVX", "SHEL", "BP"],
+    ("Industrials", "Aerospace & Defense"): ["GE", "RTX", "LMT", "BA"],
+    ("Industrials", "Farm & Heavy Construction Machinery"): ["CAT", "DE"],
+    ("Utilities", "Utilities - Regulated Electric"): ["NEE", "SO", "DUK", "AEP", "D"],
+}
+
+# Hand-picked peer sets where the Yahoo industry would mislead, with the reason
+# printed in the report.
+TICKER_PEERS = {
+    "AAPL": (["SONY", "DELL", "HPQ", "MSFT", "GOOGL", "META"],
+             "Yahoo's Consumer Electronics industry has only one comparable US-listed peer (SONY); "
+             "widened to hardware makers (DELL, HPQ) and mega-cap consumer technology platforms."),
+    "GOOGL": (["META", "SPOT", "MSFT", "AMZN", "NFLX"],
+              "Internet Content has only two other large peers; widened to mega-cap platforms "
+              "competing for digital advertising, cloud and consumer attention."),
+    "MSFT": (["ORCL", "SAP", "CRM", "ADBE", "NOW", "GOOGL", "AMZN"],
+             "Mature large-cap software and cloud platforms. High-growth security names in Yahoo's "
+             "Software - Infrastructure industry (PLTR, CRWD, PANW) are excluded: their multiples "
+             "reflect much faster expected growth."),
+    "META": (["GOOGL", "SPOT", "SNAP", "PINS", "MSFT"],
+             "Digital-advertising platforms (Internet Content) plus MSFT as a mega-cap platform."),
+    "MA": (["V", "AXP", "PYPL"],
+           "Payment networks and processors. Card lenders (COF, SYF) are excluded: they carry "
+           "credit risk on their balance sheet and trade at very different multiples."),
+    "V": (["MA", "AXP", "PYPL"],
+          "Payment networks and processors. Card lenders (COF, SYF) are excluded: they carry "
+          "credit risk on their balance sheet and trade at very different multiples."),
+}
+MIN_PEERS = 3
+
 # ── API Keys (loaded from .env) ───────────────────────────────────────────────
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
 NEWS_API_KEY      = os.getenv("NEWS_API_KEY", "")

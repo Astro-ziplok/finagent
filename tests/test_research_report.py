@@ -83,7 +83,8 @@ class TestResearchReport(unittest.TestCase):
             return thesis_reply if "Write the investment thesis" in prompt else sections_reply
 
         with patch("src.report.research_report._call_groq_json", side_effect=fake_llm):
-            return build_research_report(tickers, self.cleaned, self.yf, self.bench, out_root=self.tmp)
+            return build_research_report(tickers, self.cleaned, self.yf, self.bench, out_root=self.tmp,
+                                         use_valuation=False)
 
     def test_single_company_report_structure(self):
         path = self._build(["AAA"], [THESIS, SECTIONS])
@@ -124,7 +125,8 @@ class TestResearchReport(unittest.TestCase):
     def test_data_only_mode_makes_no_llm_calls(self):
         from src.report.research_report import build_research_report
         with patch("src.report.research_report._call_groq_json") as m:
-            build_research_report(["AAA"], self.cleaned, self.yf, self.bench, out_root=self.tmp, use_llm=False)
+            build_research_report(["AAA"], self.cleaned, self.yf, self.bench, out_root=self.tmp, use_llm=False,
+                                  use_valuation=False)
         m.assert_not_called()
 
 

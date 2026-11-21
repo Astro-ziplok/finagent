@@ -28,6 +28,11 @@ finagent/
 │   │   ├── yfinance_fundamentals.py ← Income, balance sheet, cash flow (free)
 │   │   └── quota.py                 ← Alpha Vantage daily quota tracker
 │   ├── analysis/ai_analysis.py      ← Groq LLM analysis functions
+│   ├── valuation/                   ← DCF, reverse DCF, residual income, DDM, peer comparables
+│   │   ├── engine.py                ← Chooses methods per company type, weights them, cites sources
+│   │   ├── models.py                ← The valuation maths (pure functions, unit-tested)
+│   │   ├── inputs.py                ← Treasury yield, estimates, peers (each with its source)
+│   │   └── summary.py               ← Terminal valuation summary
 │   └── report/
 │       ├── research_report.py       ← Research report (HTML + PDF) in equity-research layout
 │       └── figures.py               ← Sidebar figures for the report
@@ -200,6 +205,7 @@ You: quit
 | Income statement | "Income statement Amazon 2024 vs 2025" | 0 (yfinance) |
 | Balance sheet | "Balance sheet MSFT" | 0 (yfinance) |
 | Cash flow | "Cash flow Amazon" | 0 (yfinance) |
+| Valuation | "What is Apple worth?" / "Is NVDA overvalued?" | 1 per day (10-year Treasury yield, cached) |
 | News | "Latest news for GOOGL" | 1 per ticker |
 | Commodities | "Show me commodity prices" | 0 (Yahoo Finance) |
 | Sectors | "What sectors are trending?" | 0 (Yahoo Finance) |
@@ -226,8 +232,55 @@ Saved to `reports/research/TICKER_YYYY-MM-DD/`:
 | `figNN.png` | The figures, kept as separate files so the HTML stays small |
 | `data.json` | Every number the report used, handy for checking or for asking Claude about the report |
 
-No Microsoft Word is needed. A single-company report takes about 30 seconds; comparisons can take up to
+No Microsoft Word is needed. A single-company report takes about 30-80 seconds; comparisons can take up to
 ~2 minutes because the agent waits out the Groq free tier's per-minute token limit between AI calls.
+
+---
+
+## Valuation
+
+Every research report includes a valuation section, and `"What is X worth?"` prints a valuation in the
+terminal. There is **no buy/sell rating**: the report shows a model fair value, its range and the implied
+upside or downside, and explains what drives it.
+
+**Methods are chosen to fit the company** (CFA practice), rather than running every model:
+
+| Company type | Detected by | Weighted methods | Cross-checks |
+|---|---|---|---|
+| Profitable, cash-generative | Positive free cash flow in most of the last 4 years | DCF (FCFF) 50% + peer multiples 50% | Reverse DCF, peer regression, own P/E history |
+| Bank / insurer | Yahoo industry is a bank, insurer or capital-markets firm | Residual income 50% + peer multiples 50% | DDM (if payout >= 40%), own P/E history |
+| Mature dividend payer | Dividend yield >= 2% and payout >= 40% | DDM 40% + DCF 30% + peers 30% | Reverse DCF, regression, history |
+| High-growth / unprofitable | Negative or unstable free cash flow, or negative EPS | EV/Sales and P/E peer multiples | Reverse DCF where possible |
+
+Methods that don't fit are listed with the reason they were not used (e.g. residual income for Apple,
+whose book value is shrunk by buybacks).
+
+**What each method uses:**
+- **DCF (FCFF):** 10-year forecast. Years 1-2 use analyst consensus revenue growth, later years fade to
+  terminal growth. Free-cash-flow margin is the 3-year average after deducting stock-based compensation.
+  Discounted at WACC (CAPM cost of equity with Blume-adjusted beta). Includes bull/bear scenarios and a
+  WACC x terminal-growth sensitivity grid.
+- **Reverse DCF:** the annual revenue growth today's price requires, compared with analyst consensus.
+- **Residual income / DDM:** analyst EPS estimates, book value and dividends, discounted at the cost of equity.
+- **Peer multiples:** forward P/E, EV/EBITDA, EV/Sales or P/B (depending on company type) at the peer median
+  (range: 25th-75th percentile), plus a regression of peers' P/E on expected growth (P/B on ROE for banks).
+
+**Every assumption is cited** in the report (sidebar summary + Appendix G with full sources) and in the
+terminal output. Defaults live in `config.py` and can be edited:
+
+| Setting | Default | Where |
+|---|---|---|
+| Risk-free rate | Live 10-year Treasury yield (Federal Reserve H.15 via Alpha Vantage; Yahoo ^TNX fallback) | fetched, cached daily |
+| Equity risk premium | 5.0% | `VALUATION_ASSUMPTIONS` |
+| Terminal growth | 2.5% | `VALUATION_ASSUMPTIONS` |
+| Forecast horizon | 10 years | `VALUATION_ASSUMPTIONS` |
+| Beta adjustment | 0.67 x raw + 0.33 (Blume / Bloomberg) | `VALUATION_ASSUMPTIONS` |
+| Method weights | see table above | `VALUATION_WEIGHTS` |
+| Peer groups | Same Yahoo industry; widened to sector if fewer than 3; hand-picked overrides with reasons | `INDUSTRY_PEERS`, `TICKER_PEERS` |
+
+**Read the results with care.** At a ~5% risk-free rate, textbook models often value mega-cap stocks well
+below their market price. The reverse DCF is usually the most useful line: it shows what growth the price
+already assumes. Model values are estimates that depend on the assumptions above, not forecasts.
 
 ---
 
@@ -251,7 +304,7 @@ To change the default tickers, edit `TICKERS` in `config.py`.
 | Key | Where to Get | Cost |
 |-----|-------------|------|
 | `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) | Free |
-| `ALPHA_VANTAGE_KEY` | [alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key) | Free (25/day) |
+| `ALPHA_VANTAGE_KEY` | [alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key) | Free (25/day). Used for the 10-year Treasury yield (valuation risk-free rate, 1 call/day), news sentiment and company overview |
 | `NEWS_API_KEY` | [newsapi.org/register](https://newsapi.org/register) | Free, optional |
 
 Add all keys to your `.env` file. Never commit `.env` to GitHub - it is listed in `.gitignore`.

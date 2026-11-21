@@ -41,6 +41,8 @@ from src.analysis.ai_analysis import (_build_data_context, _calendar_breakdown, 
                                       _metrics_facts, _income_facts, _balance_facts,
                                       _cashflow_facts, _fmt_big, DISCLAIMER, NUMERIC_RULES)
 from src.report import figures as F
+from src.report import valuation_section as VS
+from src.valuation.engine import value_company
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,7 @@ class Figure:
     file: str         # "fig01.png"
     shows: str        # one-line description given to the language model
     source: str
+    html: str = ""    # sidebar table (used instead of an image when set)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,7 +143,7 @@ def _risk_flags(c: dict, m: dict, dd: dict, inc_f: dict, bal_f: dict, cf_annual:
     return flags
 
 
-def _collect_facts(tickers, ctx, cleaned, yf_data, rss_news) -> dict:
+def _collect_facts(tickers, ctx, cleaned, yf_data, rss_news, valuations=None) -> dict:
     facts = {}
     for t in tickers:
         c, d = ctx[t], yf_data.get(t) or {}
@@ -189,7 +192,16 @@ def _collect_facts(tickers, ctx, cleaned, yf_data, rss_news) -> dict:
             "risk_flags": _risk_flags(c, m, dd, inc_f, bal_f, cf.get("annual") or []),
             "recent_headlines": headlines,
             "data_notes": notes,
+            "valuation": VS.valuation_facts((valuations or {}).get(t)),
         })
+        v = (valuations or {}).get(t) or {}
+        if v.get("upside") is not None and v["upside"] < -0.15:
+            facts[t]["risk_flags"].append(
+                f"Price is {abs(v['upside']) * 100:.0f}% above the model fair value (${v['fair_value']:,.2f})")
+        if v.get("dcf") and v["dcf"]["terminal_share_of_ev"] > 0.7:
+            facts[t]["risk_flags"].append(
+                f"DCF depends heavily on the long run: terminal value is "
+                f"{v['dcf']['terminal_share_of_ev'] * 100:.0f}% of enterprise value")
     return facts
 
 
@@ -197,7 +209,7 @@ def _collect_facts(tickers, ctx, cleaned, yf_data, rss_news) -> dict:
 #  2. Figures
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_figures(tickers, ctx, cleaned, yf_data, benchmark_df, out_dir: Path) -> list:
+def _make_figures(tickers, ctx, cleaned, yf_data, benchmark_df, out_dir: Path, valuations=None) -> list:
     """Draw every figure the data supports and number them in reading order."""
     single = len(tickers) == 1
     t0 = tickers[0]
@@ -241,15 +253,42 @@ def _make_figures(tickers, ctx, cleaned, yf_data, benchmark_df, out_dir: Path) -
          ("cash, total debt and debt-to-equity by fiscal year" if single
           else "debt-to-equity and current ratio per ticker"), SOURCE_FIN,
          lambda p: F.balance_sheet(yf, p)),
-        ("valuation", "Shareholder Returns vs Free Cash Flow [USD bn]",
+        ("financial", "Shareholder Returns vs Free Cash Flow [USD bn]",
          "buybacks and dividends stacked against free cash flow by fiscal year", SOURCE_FIN,
          lambda p: F.shareholder_returns(yf, p)),
-        ("valuation", "Valuation Multiples [x] (shaded: typical S&P 500 P/E 20-25x)",
-         "trailing and forward P/E, P/S and P/B", "Source: Yahoo Finance, FinAgent analysis",
-         lambda p: F.valuation_multiples(yf, p)),
     ]
+    vals = {t: v for t, v in (valuations or {}).items() if v}
+    if vals:
+        v0 = vals.get(t0)
+        specs += [
+            ("valuation", "Valuation Summary", "each method's value per share, its weight, the weighted fair "
+             "value and implied upside/downside", "Source: FinAgent valuation (Appendix F)", VS.summary_table(vals)),
+            ("valuation", "Valuation Football Field" + (" [% vs price]" if not single else " [USD/share]"),
+             "value range of every method against today's price and the 52-week range",
+             "Source: FinAgent valuation; Yahoo Finance prices", lambda p: F.football_field(vals, p)),
+            ("valuation", "Key Valuation Assumptions", "risk-free rate, ERP, beta, cost of equity, WACC, "
+             "terminal growth, horizon", "Sources: see Appendix G", VS.key_assumptions(vals)),
+        ]
+        if single and v0:
+            specs += [
+                ("valuation", "DCF Sensitivity: WACC vs Terminal Growth", "DCF value per share across WACC "
+                 "and terminal-growth assumptions", "Source: FinAgent valuation", VS.sensitivity_table(v0)),
+                ("valuation", f"Peer Regression: {(v0.get('regression') or {}).get('y_label', '')} vs "
+                 f"{(v0.get('regression') or {}).get('x_label', '')}",
+                 "peers' multiple against their fundamentals with the fitted line; the company highlighted",
+                 "Source: Yahoo Finance, FinAgent analysis",
+                 lambda p: F.peer_regression(v0.get("regression"), t0, p)),
+                ("valuation", "Trailing P/E History [x]", "the company's own trailing P/E with mean and "
+                 "+/-1 standard deviation", "Source: Yahoo Finance prices and reported EPS, FinAgent analysis",
+                 lambda p: F.pe_history(v0.get("history"), p)),
+            ]
     out, n = [], 0
     for section, title, shows, source, draw in specs:
+        if isinstance(draw, str):          # ready-made sidebar table
+            if draw:
+                n += 1
+                out.append(Figure(f"Fig.{n:02d}", section, title, "", shows, source, html=draw))
+            continue
         fname = f"fig{n + 1:02d}.png"
         try:
             ok = draw(out_dir / fname)
@@ -276,6 +315,9 @@ Hard rules:
 - The business description must come from profile.business_summary only.
 - Cite figures as (Fig.NN) using only the IDs in FIGURES, where they support the point.
 - Do not issue buy/sell ratings or price targets of your own. You may cite the analyst consensus in DATA.
+- valuation.fair_value is a model estimate, not a target: describe it as "model fair value" with its range,
+  say which assumptions drive it (cost of capital, terminal value share, peer group), and use the reverse
+  DCF to explain what growth today's price requires. If valuation_gap_note is present, explain it.
 - Never mention DATA field names or cite DATA in parentheses (no "(vs_benchmark)", "(analyst)",
   "(balance sheet facts)"). Write for a human reader; parentheses are only for figure citations.
 - If data_notes are present, follow them and do not compare numbers based on different prices
@@ -289,7 +331,7 @@ Hard rules:
 PARAGRAPHS_SHAPE = '[{"lead": "short bold lead-in, 3-8 words", "text": "60-110 words"}]'
 
 
-def _compact_for_llm(facts: dict) -> dict:
+def _compact_for_llm(facts: dict, level: int = 1) -> dict:
     """
     Shorter version of the facts for the language model (data.json keeps the full
     version). Groq's free tier caps prompt + output at 8,000 tokens per minute, so
@@ -320,8 +362,38 @@ def _compact_for_llm(facts: dict) -> dict:
         g["returns"] = {k: v for k, v in (g.get("returns") or {}).items()
                         if k not in ("mean_daily_pct", "std_daily_pct", "risk_free_rate_used_pct")}
         g["momentum"] = {k: v for k, v in (g.get("momentum") or {}).items() if k != "last_30d_avg_volume"}
+        if level >= 2:
+            g = _tighter(g)
         slim[t] = g
     return slim
+
+
+def _tighter(g: dict) -> dict:
+    """
+    Level-2 compaction for comparison reports: one line per valuation method,
+    only the latest two years of statement changes, no low-value context.
+    """
+    for k in ("recent_headlines", "technical", "quarterly_returns", "momentum", "period", "growth"):
+        g.pop(k, None)
+    g["profile"] = {**(g.get("profile") or {}),
+                    "business_summary": ((g.get("profile") or {}).get("business_summary") or "")[:300]}
+    inc = g.get("income_statement_facts") or {}
+    g["income_statement_facts"] = {k: (v[-2:] if isinstance(v, list) else v) for k, v in inc.items()
+                                   if not k.startswith("latest_quarter_vs_prior")}
+    cf = g.get("cash_flow_facts") or {}
+    g["cash_flow_facts"] = {k: (v[-2:] if isinstance(v, list) else v) for k, v in cf.items()
+                            if not k.startswith("capex_")}
+    bal = g.get("balance_sheet_facts") or {}
+    g["balance_sheet_facts"] = {k: v for k, v in bal.items()
+                                if k in ("latest_cash_vs_total_debt", "leverage_assessment", "retained_earnings_note")}
+    v = dict(g.get("valuation") or {})
+    if v.get("methods"):
+        v["methods"] = {k: (f"{m['value']} ({m['role']}, weight {m['weight_pct']}%, range {m['range'][0]}-{m['range'][1]})"
+                            if "value" in m else f"not used: {m['not_used_because'][:90]}")
+                        for k, m in v["methods"].items()}
+    v.pop("peer_multiples", None)
+    g["valuation"] = v
+    return g
 
 
 def _thesis_prompt(label, facts, figs, benchmark):
@@ -343,7 +415,8 @@ Return JSON with this shape:
   "theses": [{{"heading": "thesis headline, 5-10 words", "paragraphs": {PARAGRAPHS_SHAPE}}}]
 }}
 Exactly 3 theses with 1-2 paragraphs each. The three must form ONE argument that supports
-overall_view; one thesis must address the strongest counter-argument from risk_flags.
+overall_view; one thesis must address valuation (model fair value vs price, and what the reverse DCF
+implies); one must address the strongest counter-argument from risk_flags.
 """
 
 
@@ -362,8 +435,11 @@ def _sections_prompt(label, facts, figs, thesis, keys=SECTION_KEYS):
         "business": "- business: 1-2 blocks, based on profile.business_summary (what it sells, segments, customers).",
         "performance": "- performance: 2 blocks: returns vs benchmark and quarters; volatility, drawdown, beta, Sharpe.",
         "financial": "- financial: 3-4 blocks: revenue & earnings, margins, cash flow & shareholder returns, balance sheet.",
-        "valuation": ("- valuation: 1-2 blocks: multiples vs typical market range, forward vs trailing P/E, FCF yield,\n"
-                      "  analyst consensus range, and whether growth supports the multiple."),
+        "valuation": ("- valuation: 3-4 blocks: (1) why these methods (valuation.why_these_methods, methods not used),\n"
+                      "  (2) DCF result, terminal value share and the reverse DCF versus consensus growth,\n"
+                      "  (3) peer multiples / regression / own P/E history, naming the peer group and why,\n"
+                      "  (4) weighted model fair value and range vs price, and the assumptions it is most sensitive to\n"
+                      "  (use dcf_sensitivity numbers exactly). Valuation blocks may have 1-2 paragraphs each."),
         "risks": ("- risks: 4-6 risks taken from risk_flags. Codes: M = market, V = valuation, F = financial, B = business,\n"
                   "  numbered M1, M2, V1... Order from most to least important."),
     }
@@ -449,9 +525,28 @@ def _fallback_narrative(label, facts) -> tuple:
 #  4. HTML rendering
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Every key in the facts given to the language model; filled by build_research_report.
+# Any "(key)" the model echoes back is a data-field citation and is removed.
+_FIELD_NAMES: set = set()
+
+
+def _collect_keys(obj, out: set):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.add(str(k).lower())
+            _collect_keys(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_keys(v, out)
+    return out
+
+
 def _render_text(text: str, valid_ids: set) -> str:
     """Escape LLM text, keep **bold**, and turn valid Fig.NN citations into links."""
     s = html.escape(str(text or ""))
+    if _FIELD_NAMES:
+        s = re.sub(r"\s*\(([A-Za-z0-9_. ]+)\)",
+                   lambda m: "" if m.group(1).strip().lower() in _FIELD_NAMES else m.group(0), s)
     s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
 
     def fig(m):
@@ -510,9 +605,9 @@ def _risks_body(risks, valid) -> str:
 
 def _figure_html(f: Figure) -> str:
     anchor = f.fid.replace(".", "").lower()
+    body = f.html if f.html else f'<img src="{f.file}" alt="{html.escape(f.title)}">'
     return (f'<figure id="{anchor}"><div class="fig-title">{html.escape(f.fid)}: {html.escape(f.title)}</div>'
-            f'<img src="{f.file}" alt="{html.escape(f.title)}">'
-            f'<figcaption>{html.escape(f.source)}</figcaption></figure>')
+            f'{body}<figcaption>{html.escape(f.source)}</figcaption></figure>')
 
 
 def _money(v):
@@ -614,6 +709,15 @@ GLOSSARY = [
     ("PEG", "P/E divided by expected earnings growth."), ("ROE / ROA", "Return on equity / on assets."),
     ("Sharpe ratio", f"Annualised excess return over the risk-free rate ({RISK_FREE_RATE * 100:.1f}%) per unit of volatility."),
     ("TTM", "Trailing twelve months."), ("Volatility", "Annualised standard deviation of daily returns."),
+    ("DCF / FCFF", "Discounted cash flow of free cash flow to the firm (before payments to lenders and shareholders)."),
+    ("WACC", "Weighted average cost of capital: blended required return of shareholders and lenders."),
+    ("CAPM", "Capital asset pricing model: cost of equity = risk-free rate + beta x equity risk premium."),
+    ("ERP", "Equity risk premium: extra return investors require for owning stocks over Treasuries."),
+    ("Terminal value", "Value of all cash flows after the forecast period, assuming steady growth."),
+    ("Reverse DCF", "The growth rate that makes the DCF value equal today's share price."),
+    ("Residual income", "Profit above the return shareholders require on book equity."),
+    ("DDM", "Dividend discount model: value = present value of future dividends."),
+    ("EV / EBITDA", "Enterprise value (equity + net debt) divided by earnings before interest, tax, depreciation and amortisation."),
 ]
 
 CSS = """
@@ -668,10 +772,10 @@ dl.gloss dt { font-weight:700; } dl.gloss dd { margin:0; }
 """
 
 
-def _render_html(label, tickers, thesis, sections, figs, facts, ctx, yf_data) -> str:
+def _render_html(label, tickers, thesis, sections, figs, facts, ctx, yf_data, valuations=None) -> str:
     valid = {f.fid for f in figs}
     by_sec = {k: [f for f in figs if f.section == k] for k, _ in SECTIONS}
-    parts = [f"<title>{html.escape(label)} Research Report</title><style>{CSS}</style><div class=page>"]
+    parts = [f"<title>{html.escape(label)} Research Report</title><style>{CSS}{VS.VALUATION_CSS}</style><div class=page>"]
 
     title = thesis.get("title") or f"{label}: RESEARCH REPORT"
     parts.append(f"<h1 class=doc-title>{html.escape(title)}</h1>")
@@ -680,6 +784,13 @@ def _render_html(label, tickers, thesis, sections, figs, facts, ctx, yf_data) ->
     if thesis.get("overall_view"):
         parts.append(f"<p class=view>Overall view: <b>{html.escape(thesis['overall_view'])}</b>"
                      f" — {_render_text(thesis.get('view_rationale', ''), valid)}</p>")
+    for t in tickers:
+        v = (valuations or {}).get(t) or {}
+        if v.get("fair_value") and v.get("price"):
+            parts.append(f"<p class=fair>{html.escape(t)} model fair value: <b>${v['fair_value']:,.2f}</b> "
+                         f"(range ${v['fair_low']:,.0f}–${v['fair_high']:,.0f}) vs price ${v['price']:,.2f}: "
+                         f"<b>{v['upside'] * 100:+.1f}%</b> implied. Not a recommendation; see Valuation and Appendix G "
+                         "for methods and assumptions.</p>")
 
     notes = [f"{t}: {n}" for t in tickers for n in (facts.get(t) or {}).get("data_notes", [])]
     for n in notes:
@@ -717,8 +828,14 @@ def _render_html(label, tickers, thesis, sections, figs, facts, ctx, yf_data) ->
             app += [f"<div class=table-wrap>{x}</div>" for x in tables]
     app.append("<div class=app-bar>Appendix E – Key Metrics</div>")
     app.append(f"<div class=table-wrap>{_metrics_table(tickers, yf_data, ctx)}</div>")
+    vals = {t: v for t, v in (valuations or {}).items() if v}
+    if vals:
+        app.append("<div class=app-bar>Appendix F – Valuation Detail</div>")
+        app.append(VS.appendix_valuation(vals))
+        app.append("<div class=app-bar>Appendix G – Valuation Assumptions &amp; Sources</div>")
+        app.append(VS.appendix_sources(vals))
     p0 = ctx[tickers[0]]["period"]
-    app.append("<div class=app-bar>Appendix F – Methodology &amp; Data Sources</div><div class=method>"
+    app.append("<div class=app-bar>Appendix H – Methodology &amp; Data Sources</div><div class=method>"
                f"<p>Price data: Yahoo Finance daily, adjusted for splits and dividends, {p0['start']} to {p0['end']}. "
                f"Benchmark: {BENCHMARK_TICKER}. Financial statements and analyst consensus: Yahoo Finance. "
                f"Sharpe ratio is annualised using a {RISK_FREE_RATE * 100:.1f}% risk-free rate. Quarters are "
@@ -740,7 +857,8 @@ def _render_html(label, tickers, thesis, sections, figs, facts, ctx, yf_data) ->
 
 def build_research_report(tickers: list, cleaned_data: dict, yf_data: dict,
                           benchmark_df: pd.DataFrame = None, rss_news=None,
-                          out_root: Path = None, use_llm: bool = True) -> Path:
+                          out_root: Path = None, use_llm: bool = True,
+                          use_valuation: bool = True) -> Path:
     """
     Build the HTML research report and return the path to report.html.
 
@@ -752,6 +870,7 @@ def build_research_report(tickers: list, cleaned_data: dict, yf_data: dict,
         rss_news:     DataFrame from fetch_rss_news(), optional (headlines as context)
         out_root:     folder to create the report folder in (default reports/research)
         use_llm:      False builds a data-only report (no API calls)
+        use_valuation: False skips the valuation module (no extra downloads)
     """
     tickers = [t for t in tickers if t in cleaned_data]
     if not tickers:
@@ -763,11 +882,24 @@ def build_research_report(tickers: list, cleaned_data: dict, yf_data: dict,
         old.unlink()
 
     ctx = _build_data_context({t: cleaned_data[t] for t in tickers}, benchmark_df=benchmark_df)
-    facts = _collect_facts(tickers, ctx, cleaned_data, yf_data, rss_news)
-    figs = _make_figures(tickers, ctx, cleaned_data, yf_data, benchmark_df, out_dir)
+    valuations = {}
+    if use_valuation:
+        for t in tickers:
+            print(f"  Valuing {t} (DCF / residual income / DDM / peers as appropriate)...")
+            try:
+                valuations[t] = value_company(t, yf_data.get(t) or {})
+            except Exception as e:   # valuation problems must not stop the report
+                logger.warning(f"Valuation for {t} failed: {e}")
+    facts = _collect_facts(tickers, ctx, cleaned_data, yf_data, rss_news, valuations)
+    figs = _make_figures(tickers, ctx, cleaned_data, yf_data, benchmark_df, out_dir, valuations)
 
     thesis, sections = {}, {}
     llm_facts = _compact_for_llm(facts)
+    if _output_budget(_thesis_prompt(label, llm_facts, figs, BENCHMARK_TICKER), 1800) < 1500:
+        llm_facts = _compact_for_llm(facts, level=2)     # comparison reports: tighter facts
+    _FIELD_NAMES.clear()
+    _collect_keys(llm_facts, _FIELD_NAMES)
+    _FIELD_NAMES.difference_update({t.lower() for t in tickers})   # keep "(AAPL)" etc.
     if use_llm:
         print("  Writing investment thesis...")
         tp = _thesis_prompt(label, llm_facts, figs, BENCHMARK_TICKER)
@@ -789,12 +921,22 @@ def build_research_report(tickers: list, cleaned_data: dict, yf_data: dict,
                            "likelihood vs impact of the risks listed", "Source: FinAgent analysis"))
 
     (out_dir / "report.html").write_text(
-        _render_html(label, tickers, thesis, sections, figs, facts, ctx, yf_data), encoding="utf-8")
+        _render_html(label, tickers, thesis, sections, figs, facts, ctx, yf_data, valuations), encoding="utf-8")
     (out_dir / "data.json").write_text(json.dumps(
         {"tickers": tickers, "generated": str(date.today()), "facts": facts,
-         "figures": [f.__dict__ for f in figs], "thesis": thesis, "sections": sections},
+         "figures": [{k: x for k, x in f.__dict__.items() if k != "html"} for f in figs],
+         "valuations": {t: _json_safe_valuation(v) for t, v in valuations.items()},
+         "thesis": thesis, "sections": sections},
         indent=1, default=str), encoding="utf-8")
     return out_dir / "report.html"
+
+
+def _json_safe_valuation(v: dict) -> dict:
+    """Valuation result without bulky objects (price series), for data.json."""
+    out = {k: x for k, x in v.items() if k not in ("history",)}
+    if v.get("history"):
+        out["history"] = {k: x for k, x in v["history"].items() if k != "series"}
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
