@@ -221,14 +221,5 @@ class TestCommodityHandling(unittest.TestCase):
             self.assertEqual(generate_sector_analysis(sectors, commodities), "ok")
 
 
-class TestReportExporterSections(unittest.TestCase):
-
-    def test_agent_style_headers_are_parsed(self):
-        from src.export.report_exporter import _parse_sections
-        text = "\n-- AAPL TREND ANALYSIS --\nBody one.\n\n-- RISK COMMENTARY --\nBody two."
-        sections = _parse_sections(text)
-        self.assertEqual([s["title"] for s in sections], ["AAPL TREND ANALYSIS", "RISK COMMENTARY"])
-
-
 if __name__ == "__main__":
     unittest.main()

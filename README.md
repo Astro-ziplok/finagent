@@ -28,10 +28,13 @@ finagent/
 │   │   ├── yfinance_fundamentals.py ← Income, balance sheet, cash flow (free)
 │   │   └── quota.py                 ← Alpha Vantage daily quota tracker
 │   ├── analysis/ai_analysis.py      ← Groq LLM analysis functions
-│   └── export/report_exporter.py   ← PDF report generator (analysis + charts)
+│   └── report/
+│       ├── research_report.py       ← Research report (HTML + PDF) in equity-research layout
+│       └── figures.py               ← Sidebar figures for the report
 ├── reports/
 │   ├── charts/                      ← Charts organised by ticker
-│   ├── analysis/                    ← AI analysis text reports + exported PDFs
+│   ├── analysis/                    ← AI analysis text reports (terminal output)
+│   ├── research/                    ← Research reports: TICKER_date/report.html, report.pdf, figNN.png, data.json
 │   └── data_snapshots/              ← Summary statistics CSVs
 ├── tests/                           ← unit tests (pytest)
 ├── agent.py                         ← PRIMARY entry point - interactive agent
@@ -125,7 +128,9 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-This installs all required Python libraries. It may take 2-5 minutes depending on your internet speed. You only need to do this once.
+This installs only the libraries the code actually uses (about 1 minute on a normal connection). You only need to do this once.
+
+To also run the unit tests, install the dev extras instead: `pip install -r requirements-dev.txt`
 
 ---
 
@@ -204,10 +209,25 @@ Type `help` to see query examples again.
 
 After every analysis, the agent will ask:
 ```
-Export this analysis as a PDF report? (yes/no):
+Create a research report for AAPL? (yes/no):
 ```
-Type `yes` to generate a formatted PDF containing the full analysis text and all charts
-saved to `reports/analysis/TICKER_report_YYYY-MM-DD.pdf`. Requires Microsoft Word on Windows.
+Type `yes` to build a research report laid out like an equity research note (CFA Research
+Challenge style): a headline thesis and overall view, then Investment Summary, Business
+Description, Market Performance & Risk Profile, Financial Analysis, Valuation and Investment
+Risks, with numbered figures in a left sidebar and financial tables in the appendix.
+Asking about two or more tickers (e.g. "Compare AAPL and MSFT") produces a comparison report.
+
+Saved to `reports/research/TICKER_YYYY-MM-DD/`:
+
+| File | What it is |
+|---|---|
+| `report.html` | The report. Opens automatically in your browser |
+| `report.pdf` | Created automatically if Microsoft Edge or Google Chrome is installed (otherwise press Ctrl+P → Save as PDF) |
+| `figNN.png` | The figures, kept as separate files so the HTML stays small |
+| `data.json` | Every number the report used, handy for checking or for asking Claude about the report |
+
+No Microsoft Word is needed. A single-company report takes about 30 seconds; comparisons can take up to
+~2 minutes because the agent waits out the Groq free tier's per-minute token limit between AI calls.
 
 ---
 
@@ -241,7 +261,7 @@ Add all keys to your `.env` file. Never commit `.env` to GitHub - it is listed i
 ## Unit Tests
 
 ```bash
-pip install pytest
+pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
@@ -262,7 +282,7 @@ All tests use synthetic data - no real API calls are made during testing.
 | Groq API 403 error | Network issue - turn on VPN and try again |
 | Yellow warnings in VS Code | `Ctrl+Shift+P` → `Python: Select Interpreter` → select the venv option |
 | `cd finagent` fails | Run `dir` to check your current folder location |
-| PDF export fails | Microsoft Word must be installed. Falls back to .docx if Word is missing |
+| No `report.pdf` created | Edge or Chrome was not found. Open `report.html` and press Ctrl+P → Save as PDF, or set `FINAGENT_BROWSER` in `.env` to your browser's path |
 
 ---
 

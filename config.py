@@ -125,6 +125,9 @@ MAX_TOKENS    = 1500
 REASONING_TOKEN_BUFFER = 1024
 # Extra request options for reasoning models ("low" keeps latency and token use down).
 GROQ_EXTRA_BODY = {"reasoning_effort": "low"} if "gpt-oss" in GROQ_MODEL else {}
+# Groq tokens-per-minute cap for your account tier (free tier: 8000). The research
+# report sizes its requests to fit under it; raise it in .env if you upgrade.
+GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "8000"))
 
 # ── Chart Settings ────────────────────────────────────────────────────────────
 CHART_DPI     = 150

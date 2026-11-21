@@ -26,7 +26,6 @@ logging.getLogger("matplotlib").setLevel(logging.ERROR)
 logging.getLogger("matplotlib.category").setLevel(logging.ERROR)
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -111,6 +110,41 @@ def plot_price_and_volume(df: pd.DataFrame, ticker: str) -> str:
 #  CHART 2: Correlation Heatmap
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _kde(values: pd.Series, points: int = 300):
+    """
+    Gaussian kernel density estimate with Scott's bandwidth, in plain numpy.
+    Same curve as pandas' .plot.kde(), which needs scipy (no longer a dependency).
+    """
+    x = np.asarray(values.dropna(), dtype=float)
+    if len(x) < 2 or x.std(ddof=1) == 0:
+        return np.array([]), np.array([])
+    bw = x.std(ddof=1) * len(x) ** (-1 / 5)          # Scott's rule
+    grid = np.linspace(x.min() - 3 * bw, x.max() + 3 * bw, points)
+    dens = np.exp(-0.5 * ((grid[:, None] - x[None, :]) / bw) ** 2).sum(axis=1)
+    return grid, dens / (len(x) * bw * np.sqrt(2 * np.pi))
+
+
+def _heatmap(ax, corr: pd.DataFrame, fmt: str = ".2f", fontsize: int = 11):
+    """
+    Annotated correlation heatmap drawn with plain matplotlib
+    (replaces seaborn.heatmap so seaborn is no longer a dependency).
+    """
+    im = ax.imshow(corr.values, cmap="RdYlGn", vmin=-1, vmax=1)
+    labels = list(corr.columns)
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
+    ax.grid(False)
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            v = corr.values[i, j]
+            ax.text(j, i, format(v, fmt), ha="center", va="center",
+                    fontsize=fontsize, fontweight="bold",
+                    color="white" if abs(v) > 0.75 else "black")
+    plt.colorbar(im, ax=ax, shrink=0.8)
+
+
 def plot_correlation_heatmap(cleaned_data: dict) -> str:
     close_prices = pd.DataFrame({t: df["Close"] for t, df in cleaned_data.items()})
     corr_matrix  = close_prices.corr()
@@ -122,11 +156,7 @@ def plot_correlation_heatmap(cleaned_data: dict) -> str:
     year_label  = f"{start_year}" if start_year == end_year else f"{start_year}–{end_year}"
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(
-        corr_matrix, annot=True, fmt=".2f", cmap="RdYlGn",
-        vmin=-1, vmax=1, ax=ax, linewidths=0.5, square=True,
-        annot_kws={"size": 11}
-    )
+    _heatmap(ax, corr_matrix, fmt=".2f", fontsize=11)
     ax.set_title(
         f"Stock Price Correlation Heatmap ({year_label})\n"
         "(1.0 = perfect positive correlation,  "
@@ -169,7 +199,8 @@ def plot_return_distributions(cleaned_data: dict) -> str:
 
         ax.hist(returns, bins=50, density=True, alpha=0.4, color=colors[i])
         # Fix 5: Proper legend label instead of raw variable name
-        returns.plot.kde(ax=ax, color=colors[i], linewidth=2, label="Daily Return (%)")
+        xs, ys = _kde(returns)
+        ax.plot(xs, ys, color=colors[i], linewidth=2, label="Daily Return (%)")
         mean_r = returns.mean()
         ax.axvline(mean_r, color="black", linestyle="--", linewidth=1.2,
                    label=f"Mean Return: {mean_r:.2f}%")
@@ -669,13 +700,7 @@ def plot_comparison_correlation_heatmap(cleaned_data: dict, cdir: "Path" = None)
 
     fig, ax = plt.subplots(figsize=(max(6, len(cleaned_data) * 2),
                                     max(5, len(cleaned_data) * 1.8)))
-    sns.heatmap(
-        corr, annot=True, fmt=".3f", cmap="RdYlGn",
-        vmin=-1, vmax=1, ax=ax,
-        linewidths=0.5, square=True,
-        annot_kws={"size": 12, "weight": "bold"},
-        cbar_kws={"shrink": 0.8}
-    )
+    _heatmap(ax, corr, fmt=".3f", fontsize=12)
     ax.set_title(
         f"Daily Return Correlation Heatmap ({year_label})\n"
         "(1.0 = perfect positive correlation,  "

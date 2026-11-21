@@ -125,6 +125,7 @@ def fetch_income_statement(ticker: str) -> dict:
                 ebitda       = get(["EBITDA", "Ebitda"])
                 rd           = get(["Research Development", "ResearchAndDevelopment",
                                     "Research And Development"])
+                eps_diluted  = get(["Diluted EPS", "DilutedEPS"])
 
                 row.update({
                     "total_revenue":    total_rev,
@@ -133,6 +134,7 @@ def fetch_income_statement(ticker: str) -> dict:
                     "net_income":       net_income,
                     "ebitda":           ebitda,
                     "rd_expense":       rd,
+                    "diluted_eps":      eps_diluted,
                     # Calculated margins
                     "gross_margin_pct":    round(gross_profit / total_rev * 100, 2)
                                           if gross_profit is not None and total_rev else None,
@@ -494,6 +496,16 @@ def fetch_key_metrics(ticker: str) -> dict:
             "name":     name,
             "sector":   sector,
             "industry": industry,
+            # Company profile: factual description from Yahoo, used by the research
+            # report so the business description is grounded rather than recalled.
+            "profile": {
+                "summary":   (info.get("longBusinessSummary") or "")[:1200],
+                "employees": info.get("fullTimeEmployees"),
+                "country":   info.get("country"),
+                "exchange":  info.get("exchange"),
+                "website":   info.get("website"),
+                "currency":  info.get("financialCurrency") or info.get("currency"),
+            },
 
             "valuation": {
                 "current_price":     current_price,

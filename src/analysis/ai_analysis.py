@@ -274,8 +274,25 @@ def _build_data_context(cleaned_data: dict, benchmark_df: pd.DataFrame = None) -
     return context
 
 
-def _call_groq(prompt: str, system_prompt: str = "", max_tokens: int = MAX_TOKENS) -> str:
-    """Send a prompt to Groq and return the response text."""
+def _retry_wait_seconds(error_text: str, attempt: int) -> float:
+    """
+    How long to wait before retrying. Groq's 429 errors say e.g.
+    "Please try again in 7.66s" (per-minute token limits), so honour that
+    instead of guessing; fall back to exponential backoff.
+    """
+    import re
+    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", error_text)
+    if m:
+        return min(float(m.group(1) or 0) * 60 + float(m.group(2)) + 1, 90)
+    return 2 ** (attempt + 1)
+
+
+def _call_groq(prompt: str, system_prompt: str = "", max_tokens: int = MAX_TOKENS,
+               json_mode: bool = False) -> str:
+    """
+    Send a prompt to Groq and return the response text.
+    With json_mode=True the model is constrained to return a JSON object.
+    """
     if not GROQ_API_KEY:
         return "⚠️  GROQ_API_KEY not set in .env file. Skipping AI analysis."
 
@@ -283,10 +300,10 @@ def _call_groq(prompt: str, system_prompt: str = "", max_tokens: int = MAX_TOKEN
     messages = [{"role": "system", "content": (system_prompt or "") + NUMERIC_RULES},
                 {"role": "user", "content": prompt}]
 
-    # Retry with exponential backoff: the Groq free tier rate-limits bursts
-    # of requests, and a "full" report makes 10+ calls in a row.
+    # Retry on rate limits / transient errors: the Groq free tier limits
+    # tokens per minute, and a full report makes several calls in a row.
     last_error = None
-    for attempt in range(4):
+    for attempt in range(5):
         try:
             response = client.chat.completions.create(
                 model=GROQ_MODEL,
@@ -294,6 +311,7 @@ def _call_groq(prompt: str, system_prompt: str = "", max_tokens: int = MAX_TOKEN
                 max_tokens=max_tokens + (REASONING_TOKEN_BUFFER if GROQ_EXTRA_BODY else 0),
                 temperature=0.2,
                 extra_body=GROQ_EXTRA_BODY or None,
+                response_format={"type": "json_object"} if json_mode else None,
             )
             content = (response.choices[0].message.content or "").strip()
             if not content:
@@ -303,14 +321,34 @@ def _call_groq(prompt: str, system_prompt: str = "", max_tokens: int = MAX_TOKEN
             last_error = e
             msg = str(e).lower()
             retryable = any(s in msg for s in ("429", "rate limit", "timeout", "503", "502",
-                                               "empty response"))
-            if not retryable or attempt == 3:
+                                               "empty response", "json_validate_failed"))
+            if not retryable or attempt == 4:
                 break
-            wait = 2 ** (attempt + 1)
-            logger.warning(f"Groq rate-limited/unavailable, retrying in {wait}s...")
+            wait = _retry_wait_seconds(msg, attempt)
+            logger.warning(f"Groq rate-limited/unavailable, retrying in {wait:.0f}s...")
             time.sleep(wait)
     logger.error(f"Groq API error: {last_error}")
     return f"⚠️  Groq API call failed: {last_error}"
+
+
+def _call_groq_json(prompt: str, system_prompt: str = "", max_tokens: int = MAX_TOKENS) -> dict:
+    """Call Groq in JSON mode and parse the result. Returns {} on any failure."""
+    raw = _call_groq(prompt, system_prompt, max_tokens=max_tokens, json_mode=True)
+    if raw.startswith("⚠️"):
+        logger.error(raw)
+        return {}
+    raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Last resort: take the outermost {...} block
+        a, b = raw.find("{"), raw.rfind("}")
+        try:
+            data = json.loads(raw[a:b + 1]) if a != -1 and b > a else {}
+        except json.JSONDecodeError:
+            logger.error("Could not parse JSON from the language model.")
+            data = {}
+    return data if isinstance(data, dict) else {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

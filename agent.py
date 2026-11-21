@@ -40,7 +40,7 @@ from src.fundamentals.alpha_vantage import (fetch_all_fundamental_data, fetch_co
                                             requests_sent)
 from src.fundamentals.yfinance_fundamentals import fetch_all_yfinance_fundamentals
 from src.fundamentals.quota import QuotaManager
-from src.export.report_exporter import export_report
+from src.report.research_report import build_research_report, export_pdf
 
 logging.basicConfig(level=logging.WARNING,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -433,6 +433,39 @@ def _run_analysis_sections(cleaned_data, intent, fundamental_data=None,
     return "\n".join(output)
 
 
+def create_research_report(tickers, cleaned_data, fundamental_data, start_year=None, end_year=None):
+    """
+    Build the HTML research report (plus a PDF when Edge/Chrome is available)
+    and open it in the browser. Fetches statements and the benchmark if this
+    query did not already load them (both are cached for the session).
+    """
+    import webbrowser
+    print("  Building research report (~30s for one company, up to ~2 min for comparisons: Groq free-tier rate limits)...")
+    yf_data = dict(fundamental_data.get("yfinance") or {})
+    missing = [t for t in tickers if not yf_data.get(t)]
+    if missing:
+        yf_data.update(get_yfinance_fundamentals(missing))
+    benchmark_df = get_benchmark_data(start_year=start_year, end_year=end_year)
+    try:
+        html_path = build_research_report(tickers, cleaned_data, yf_data, benchmark_df,
+                                          rss_news=fundamental_data.get("rss_news"))
+    except Exception as e:
+        print(f"  Report failed: {e}\n")
+        return None
+    print(f"  Report saved: {html_path}")
+    pdf = export_pdf(html_path)
+    if pdf:
+        print(f"  PDF saved:    {pdf}")
+    else:
+        print("  (No Edge/Chrome found for automatic PDF: open the HTML and press Ctrl+P -> Save as PDF.)")
+    try:
+        webbrowser.open(html_path.resolve().as_uri())
+    except Exception:
+        pass
+    print()
+    return html_path
+
+
 def save_analysis(tickers, analysis_text):
     import textwrap
     label    = "_".join(tickers) if tickers else "no_ticker"
@@ -576,25 +609,16 @@ def main():
             saved_path = save_analysis(tickers, analysis)
             print(f"  Saved to reports/analysis/{saved_path.name}\n")
 
-            # Step 9: PDF export
-            print("  Export this analysis as a PDF report? (yes/no): ", end="")
+            # Step 9: Research report (HTML, laid out like an equity research note)
+            print(f"  Create a research report for {', '.join(cleaned_data)}? (yes/no): ", end="")
             try:
                 export_choice = input().strip().lower()
             except (EOFError, KeyboardInterrupt):
                 export_choice = "no"
 
             if export_choice in ("yes", "y"):
-                print("  Generating PDF report (15-30 seconds)...")
-                pdf_path = export_report(
-                    tickers=tickers,
-                    analysis_text=analysis,
-                    chart_paths=chart_paths,
-                )
-                if pdf_path:
-                    ext = "PDF" if pdf_path.endswith(".pdf") else "Word document"
-                    print(f"  {ext} saved: {Path(pdf_path).name}\n")
-                else:
-                    print("  Export failed. Check python-docx is installed.\n")
+                create_research_report(list(cleaned_data), cleaned_data, fundamental_data,
+                                       start_year, end_year)
             else:
                 print()
 
